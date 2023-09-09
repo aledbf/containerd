@@ -108,11 +108,19 @@ func (c *closer) Close() error {
 	return c.close()
 }
 
+var (
+	ErrOpenTelemetryDisabled = fmt.Errorf("OpenTelemetry plugin is disabled (no endpoint configured)")
+)
+
 // newExporter creates an exporter based on the given configuration.
 //
 // The default protocol is http/protobuf since it is recommended by
 // https://github.com/open-telemetry/opentelemetry-specification/blob/v1.8.0/specification/protocol/exporter.md#specify-protocol.
 func newExporter(ctx context.Context, cfg *OTLPConfig) (*otlptrace.Exporter, error) {
+	if cfg.Endpoint == "" {
+		return nil, ErrOpenTelemetryDisabled
+	}
+
 	const timeout = 5 * time.Second
 
 	ctx, cancel := context.WithTimeout(ctx, timeout)
@@ -121,22 +129,19 @@ func newExporter(ctx context.Context, cfg *OTLPConfig) (*otlptrace.Exporter, err
 	switch cfg.Protocol {
 	case "", "http/protobuf":
 		var opts []otlptracehttp.Option
-		if cfg.Endpoint != "" {
-			u, err := url.Parse(cfg.Endpoint)
-			if err != nil {
-				return nil, fmt.Errorf("OpenTelemetry endpoint %q %w : %v", cfg.Endpoint, errdefs.ErrInvalidArgument, err)
-			}
-			opts = append(opts, otlptracehttp.WithEndpoint(u.Host))
-			if u.Scheme == "http" {
-				opts = append(opts, otlptracehttp.WithInsecure())
-			}
+		u, err := url.Parse(cfg.Endpoint)
+		if err != nil {
+			return nil, fmt.Errorf("OpenTelemetry endpoint %q %w : %v", cfg.Endpoint, errdefs.ErrInvalidArgument, err)
 		}
+		opts = append(opts, otlptracehttp.WithEndpoint(u.Host))
+		if u.Scheme == "http" {
+			opts = append(opts, otlptracehttp.WithInsecure())
+		}
+
 		return otlptracehttp.New(ctx, opts...)
 	case "grpc":
 		var opts []otlptracegrpc.Option
-		if cfg.Endpoint != "" {
-			opts = append(opts, otlptracegrpc.WithEndpoint(cfg.Endpoint))
-		}
+		opts = append(opts, otlptracegrpc.WithEndpoint(cfg.Endpoint))
 		if cfg.Insecure {
 			opts = append(opts, otlptracegrpc.WithInsecure())
 		}

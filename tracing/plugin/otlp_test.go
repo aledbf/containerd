@@ -35,6 +35,13 @@ func TestNewExporter(t *testing.T) {
 		output error
 	}{
 		{
+			name: "Test missing endpoint, expect ErrOpenTelemetryDisabled error",
+			input: OTLPConfig{
+				Endpoint: "",
+				Insecure: false},
+			output: ErrOpenTelemetryDisabled,
+		},
+		{
 			name: "Test http/protobuf protocol, expect no error",
 			input: OTLPConfig{Endpoint: "http://localhost:4318",
 				Protocol: "http/protobuf",
