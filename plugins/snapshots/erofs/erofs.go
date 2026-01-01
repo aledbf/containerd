@@ -377,6 +377,9 @@ func (s *snapshotter) mounts(snap storage.Snapshot, _ snapshots.Info) ([]mount.M
 	} else {
 		options = append(options, fmt.Sprintf("lowerdir={{ overlay %d %d }}", first, len(mounts)-1))
 	}
+	if snap.Kind == snapshots.KindView {
+		options = append(options, "ro")
+	}
 	options = append(options, s.ovlOptions...)
 
 	return append(mounts, mount.Mount{

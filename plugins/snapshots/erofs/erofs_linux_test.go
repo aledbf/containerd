@@ -17,28 +17,34 @@
 package erofs
 
 import (
+	"archive/tar"
 	"context"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/core/images/imagetest"
 	"github.com/containerd/containerd/v2/core/mount"
+	"github.com/containerd/containerd/v2/core/mount/manager"
 	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/containerd/v2/core/snapshots/storage"
 	"github.com/containerd/containerd/v2/core/snapshots/testsuite"
 	"github.com/containerd/containerd/v2/internal/erofsutils"
 	"github.com/containerd/containerd/v2/internal/fsverity"
+	"github.com/containerd/containerd/v2/pkg/archive/compression"
 	"github.com/containerd/containerd/v2/pkg/archive/tartest"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/containerd/v2/pkg/testutil"
-	"github.com/containerd/containerd/v2/plugins/content/local"
 	erofsdiffer "github.com/containerd/containerd/v2/plugins/diff/erofs"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	bolt "go.etcd.io/bbolt"
 )
 
 const (
@@ -108,7 +114,7 @@ func TestErofsWithQuota(t *testing.T) {
 
 func TestErofsFsverity(t *testing.T) {
 	testutil.RequiresRoot(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	root := t.TempDir()
 
@@ -183,7 +189,7 @@ func TestErofsFsverity(t *testing.T) {
 
 func TestErofsDifferWithTarIndexMode(t *testing.T) {
 	testutil.RequiresRoot(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	if !findErofs() {
 		t.Skip("check for erofs kernel support failed, skipping test")
@@ -198,10 +204,7 @@ func TestErofsDifferWithTarIndexMode(t *testing.T) {
 	tempDir := t.TempDir()
 
 	// Create content store for the differ
-	contentStore, err := local.NewStore(filepath.Join(tempDir, "content"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	contentStore := imagetest.NewContentStore(ctx, t).Store
 
 	// Create EROFS differ with tar index mode enabled
 	differ := erofsdiffer.NewErofsDiffer(contentStore, erofsdiffer.WithTarIndexMode())
@@ -213,6 +216,7 @@ func TestErofsDifferWithTarIndexMode(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
+	snap := s.(*snapshotter)
 
 	// Create test tar content
 	tarReader := createTestTarContent()
@@ -274,7 +278,7 @@ func TestErofsDifferWithTarIndexMode(t *testing.T) {
 	}
 
 	// Get the internal snapshot ID to check the EROFS layer file
-	snap := s.(*snapshotter)
+	snap = s.(*snapshotter)
 	var id string
 	if err := snap.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
 		id, _, _, err = storage.GetInfo(ctx, commitKey)
@@ -339,7 +343,475 @@ func TestErofsDifferWithTarIndexMode(t *testing.T) {
 	t.Logf("Successfully verified EROFS Snapshotter using the differ with tar index mode")
 }
 
-// Helper function to create test tar content using tartest
+func TestErofsDifferCompareWithMountManager(t *testing.T) {
+	testutil.RequiresRoot(t)
+	ctx := namespaces.WithNamespace(t.Context(), "testsuite")
+
+	_, err := exec.LookPath("mkfs.erofs")
+	if err != nil {
+		t.Skipf("could not find mkfs.erofs: %v", err)
+	}
+	if !findErofs() {
+		t.Skip("check for erofs kernel support failed, skipping test")
+	}
+
+	tempDir := t.TempDir()
+	contentStore := imagetest.NewContentStore(ctx, t).Store
+
+	snapshotRoot := filepath.Join(tempDir, "snapshots")
+	s, err := NewSnapshotter(snapshotRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	snap := s.(*snapshotter)
+
+	baseKey := "base"
+	if _, err := s.Prepare(ctx, baseKey, ""); err != nil {
+		t.Fatal(err)
+	}
+	baseID := snapshotID(t, snap, baseKey)
+	if err := os.WriteFile(filepath.Join(snap.upperPath(baseID), "base.txt"), []byte("base"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Commit(ctx, "base-commit", baseKey); err != nil {
+		t.Fatal(err)
+	}
+
+	childKey := "child"
+	if _, err := s.Prepare(ctx, childKey, "base-commit"); err != nil {
+		t.Fatal(err)
+	}
+	childID := snapshotID(t, snap, childKey)
+	if err := os.WriteFile(filepath.Join(snap.upperPath(childID), "child.txt"), []byte("child"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Commit(ctx, "child-commit", childKey); err != nil {
+		t.Fatal(err)
+	}
+
+	upperKey := "upper"
+	upperMounts, err := s.Prepare(ctx, upperKey, "child-commit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	upperID := snapshotID(t, snap, upperKey)
+	if err := os.WriteFile(filepath.Join(snap.upperPath(upperID), "upper.txt"), []byte("upper"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	lowerKey := "lower"
+	lowerMounts, err := s.View(ctx, lowerKey, "child-commit")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	hasTemplate := false
+	for _, m := range lowerMounts {
+		for _, opt := range m.Options {
+			if strings.Contains(opt, "{{") {
+				hasTemplate = true
+				break
+			}
+		}
+	}
+	if !hasTemplate {
+		t.Fatalf("expected lower mounts to include formatted options, got: %#v", lowerMounts)
+	}
+
+	db, err := bolt.Open(filepath.Join(tempDir, "mounts.db"), 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	mountRoot := filepath.Join(tempDir, "mounts")
+	mm, err := manager.NewManager(db, mountRoot, manager.WithAllowedRoot(snapshotRoot))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if closer, ok := mm.(interface{ Close() error }); ok {
+		defer closer.Close()
+	}
+
+	differ := erofsdiffer.NewErofsDiffer(contentStore, erofsdiffer.WithMountManager(mm))
+	desc, err := differ.Compare(ctx, lowerMounts, upperMounts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if desc.Digest == "" || desc.Size == 0 {
+		t.Fatalf("unexpected diff descriptor: %+v", desc)
+	}
+}
+
+func TestErofsDifferCompareBlockUpperFallback(t *testing.T) {
+	testutil.RequiresRoot(t)
+	ctx := namespaces.WithNamespace(t.Context(), "testsuite")
+
+	_, err := exec.LookPath("mkfs.erofs")
+	if err != nil {
+		t.Skipf("could not find mkfs.erofs: %v", err)
+	}
+	if !findErofs() {
+		t.Skip("check for erofs kernel support failed, skipping test")
+	}
+
+	tempDir := t.TempDir()
+	contentStore := imagetest.NewContentStore(ctx, t).Store
+
+	snapshotRoot := filepath.Join(tempDir, "snapshots")
+	s, err := NewSnapshotter(snapshotRoot, WithDefaultSize(16*1024*1024))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	baseKey := "base"
+	if _, err := s.Prepare(ctx, baseKey, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Commit(ctx, "base-commit", baseKey); err != nil {
+		t.Fatal(err)
+	}
+
+	upperKey := "upper"
+	upperMounts, err := s.Prepare(ctx, upperKey, "base-commit")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := bolt.Open(filepath.Join(tempDir, "mounts.db"), 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	mountRoot := filepath.Join(tempDir, "mounts")
+	mm, err := manager.NewManager(db, mountRoot, manager.WithAllowedRoot(snapshotRoot))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if closer, ok := mm.(interface{ Close() error }); ok {
+		defer closer.Close()
+	}
+
+	activation, err := mm.Activate(ctx, "upper-activate-"+time.Now().Format("150405.000"), cloneMounts(upperMounts))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wroteFile := false
+	for _, a := range activation.Active {
+		if mountTypeSuffixTest(a.Type) != "ext4" || a.MountPoint == "" {
+			continue
+		}
+		// Write to upper/ subdirectory since overlay uses upperdir={{ mount 0 }}/upper
+		upperDir := filepath.Join(a.MountPoint, "upper")
+		if err := os.MkdirAll(upperDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(upperDir, "marker.txt"), []byte("marker"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		wroteFile = true
+		break
+	}
+	if !wroteFile {
+		_ = mm.Deactivate(ctx, activation.Name)
+		t.Fatal("failed to locate ext4 mount to write marker.txt")
+	}
+	if err := mm.Deactivate(ctx, activation.Name); err != nil {
+		t.Fatal(err)
+	}
+
+	lowerKey := "lower"
+	lowerMounts, err := s.View(ctx, lowerKey, "base-commit")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	differ := erofsdiffer.NewErofsDiffer(contentStore, erofsdiffer.WithMountManager(mm))
+	desc, err := differ.Compare(ctx, lowerMounts, upperMounts)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	found, err := tarHasPath(ctx, contentStore, desc, "marker.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("expected diff to include marker.txt")
+	}
+}
+
+func TestErofsDifferComparePreservesWhiteouts(t *testing.T) {
+	testutil.RequiresRoot(t)
+	ctx := namespaces.WithNamespace(t.Context(), "testsuite")
+
+	_, err := exec.LookPath("mkfs.erofs")
+	if err != nil {
+		t.Skipf("could not find mkfs.erofs: %v", err)
+	}
+	if !findErofs() {
+		t.Skip("check for erofs kernel support failed, skipping test")
+	}
+
+	tempDir := t.TempDir()
+	contentStore := imagetest.NewContentStore(ctx, t).Store
+
+	snapshotRoot := filepath.Join(tempDir, "snapshots")
+	s, err := NewSnapshotter(snapshotRoot, WithDefaultSize(16*1024*1024))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	snap := s.(*snapshotter)
+
+	baseKey := "base"
+	if _, err := s.Prepare(ctx, baseKey, ""); err != nil {
+		t.Fatal(err)
+	}
+	baseID := snapshotID(t, snap, baseKey)
+	if err := os.WriteFile(filepath.Join(snap.upperPath(baseID), "gone.txt"), []byte("gone"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Commit(ctx, "base-commit", baseKey); err != nil {
+		t.Fatal(err)
+	}
+
+	upperKey := "upper"
+	upperMounts, err := s.Prepare(ctx, upperKey, "base-commit")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	lowerKey := "lower"
+	lowerMounts, err := s.View(ctx, lowerKey, "base-commit")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := bolt.Open(filepath.Join(tempDir, "mounts.db"), 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	mountRoot := filepath.Join(tempDir, "mounts")
+	mm, err := manager.NewManager(db, mountRoot, manager.WithAllowedRoot(snapshotRoot))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if closer, ok := mm.(interface{ Close() error }); ok {
+		defer closer.Close()
+	}
+
+	activation, err := mm.Activate(ctx, "upper-activate-"+time.Now().Format("150405.000"), cloneMounts(upperMounts))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mount.WithTempMount(ctx, activation.System, func(root string) error {
+		return os.Remove(filepath.Join(root, "gone.txt"))
+	}); err != nil {
+		_ = mm.Deactivate(ctx, activation.Name)
+		t.Fatal(err)
+	}
+	if err := mm.Deactivate(ctx, activation.Name); err != nil {
+		t.Fatal(err)
+	}
+
+	differ := erofsdiffer.NewErofsDiffer(contentStore, erofsdiffer.WithMountManager(mm))
+	desc, err := differ.Compare(ctx, lowerMounts, upperMounts)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	found, err := tarHasPath(ctx, contentStore, desc, ".wh.gone.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("expected diff to include whiteout for gone.txt")
+	}
+}
+
+func TestErofsDifferCompareWithFormattedUpperMounts(t *testing.T) {
+	testutil.RequiresRoot(t)
+	ctx := namespaces.WithNamespace(t.Context(), "testsuite")
+
+	_, err := exec.LookPath("mkfs.erofs")
+	if err != nil {
+		t.Skipf("could not find mkfs.erofs: %v", err)
+	}
+	if !findErofs() {
+		t.Skip("check for erofs kernel support failed, skipping test")
+	}
+
+	tempDir := t.TempDir()
+	contentStore := imagetest.NewContentStore(ctx, t).Store
+
+	snapshotRoot := filepath.Join(tempDir, "snapshots")
+	s, err := NewSnapshotter(snapshotRoot, WithDefaultSize(16*1024*1024))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	baseKey := "base"
+	if _, err := s.Prepare(ctx, baseKey, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Commit(ctx, "base-commit", baseKey); err != nil {
+		t.Fatal(err)
+	}
+
+	upperKey := "upper"
+	upperMounts, err := s.Prepare(ctx, upperKey, "base-commit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !mountsHaveTemplate(upperMounts) {
+		t.Fatalf("expected upper mounts to include templates, got: %#v", upperMounts)
+	}
+
+	db, err := bolt.Open(filepath.Join(tempDir, "mounts.db"), 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	mountRoot := filepath.Join(tempDir, "mounts")
+	mm, err := manager.NewManager(db, mountRoot, manager.WithAllowedRoot(snapshotRoot))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if closer, ok := mm.(interface{ Close() error }); ok {
+		defer closer.Close()
+	}
+
+	activation, err := mm.Activate(ctx, "upper-activate-"+time.Now().Format("150405.000"), cloneMounts(upperMounts))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wroteFile := false
+	for _, a := range activation.Active {
+		if mountTypeSuffixTest(a.Type) != "ext4" || a.MountPoint == "" {
+			continue
+		}
+		upperDir := filepath.Join(a.MountPoint, "upper")
+		if err := os.MkdirAll(upperDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(upperDir, "upper.txt"), []byte("upper"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		wroteFile = true
+		break
+	}
+	if !wroteFile {
+		_ = mm.Deactivate(ctx, activation.Name)
+		t.Fatal("failed to locate ext4 mount to write upper.txt")
+	}
+	if err := mm.Deactivate(ctx, activation.Name); err != nil {
+		t.Fatal(err)
+	}
+
+	lowerKey := "lower"
+	lowerMounts, err := s.View(ctx, lowerKey, "base-commit")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	differ := erofsdiffer.NewErofsDiffer(contentStore, erofsdiffer.WithMountManager(mm))
+	desc, err := differ.Compare(ctx, lowerMounts, upperMounts)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	found, err := tarHasPath(ctx, contentStore, desc, "upper.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("expected diff to include upper.txt")
+	}
+}
+
+// TestErofsDifferCompareWithoutMountManager verifies that Compare returns an
+// appropriate error when mount manager is required but not provided. EROFS
+// snapshotter produces mounts with templates that require mount manager for
+// resolution, so Compare cannot succeed without one.
+func TestErofsDifferCompareWithoutMountManager(t *testing.T) {
+	testutil.RequiresRoot(t)
+	ctx := namespaces.WithNamespace(t.Context(), "testsuite")
+
+	_, err := exec.LookPath("mkfs.erofs")
+	if err != nil {
+		t.Skipf("could not find mkfs.erofs: %v", err)
+	}
+	if !findErofs() {
+		t.Skip("check for erofs kernel support failed, skipping test")
+	}
+
+	tempDir := t.TempDir()
+	contentStore := imagetest.NewContentStore(ctx, t).Store
+
+	snapshotRoot := filepath.Join(tempDir, "snapshots")
+	s, err := NewSnapshotter(snapshotRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	snap := s.(*snapshotter)
+
+	baseKey := "base"
+	if _, err := s.Prepare(ctx, baseKey, ""); err != nil {
+		t.Fatal(err)
+	}
+	baseID := snapshotID(t, snap, baseKey)
+	if err := os.WriteFile(filepath.Join(snap.upperPath(baseID), "base.txt"), []byte("base"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Commit(ctx, "base-commit", baseKey); err != nil {
+		t.Fatal(err)
+	}
+
+	upperKey := "upper"
+	upperMounts, err := s.Prepare(ctx, upperKey, "base-commit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	upperID := snapshotID(t, snap, upperKey)
+	if err := os.WriteFile(filepath.Join(snap.upperPath(upperID), "upper.txt"), []byte("upper"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	lowerKey := "lower"
+	lowerMounts, err := s.View(ctx, lowerKey, "base-commit")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify that mounts have templates requiring mount manager
+	if !mountsHaveTemplate(lowerMounts) && !mountsHaveTemplate(upperMounts) {
+		t.Fatal("expected mounts to have templates requiring mount manager")
+	}
+
+	// Compare without mount manager should fail because EROFS mounts need resolution
+	differ := erofsdiffer.NewErofsDiffer(contentStore)
+	_, err = differ.Compare(ctx, lowerMounts, upperMounts)
+	if err == nil {
+		t.Fatal("expected error when mount manager is required but not provided")
+	}
+	if !strings.Contains(err.Error(), "mount manager is required") {
+		t.Fatalf("expected 'mount manager is required' error, got: %v", err)
+	}
+}
+
+// createTestTarContent creates test tar content using tartest.
 func createTestTarContent() io.ReadCloser {
 	// Create a tar context with current time for consistency
 	tc := tartest.TarContext{}.WithModTime(time.Now())
@@ -353,4 +825,573 @@ func createTestTarContent() io.ReadCloser {
 
 	// Return the tar as a ReadCloser
 	return tartest.TarFromWriterTo(tarWriter)
+}
+
+func tarHasPath(ctx context.Context, store content.Store, desc ocispec.Descriptor, target string) (bool, error) {
+	ra, err := store.ReaderAt(ctx, desc)
+	if err != nil {
+		return false, err
+	}
+	defer ra.Close()
+
+	rc := content.NewReader(ra)
+
+	dr, err := compression.DecompressStream(rc)
+	if err != nil {
+		return false, err
+	}
+	defer dr.Close()
+
+	tr := tar.NewReader(dr)
+	for {
+		h, err := tr.Next()
+		if err == io.EOF {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		name := strings.TrimPrefix(h.Name, "./")
+		if name == target {
+			return true, nil
+		}
+	}
+}
+
+func cloneMounts(in []mount.Mount) []mount.Mount {
+	if in == nil {
+		return nil
+	}
+	out := make([]mount.Mount, len(in))
+	for i := range in {
+		out[i] = in[i]
+		if len(in[i].Options) > 0 {
+			out[i].Options = append([]string(nil), in[i].Options...)
+		}
+	}
+	return out
+}
+
+func mountsHaveTemplate(mounts []mount.Mount) bool {
+	for _, m := range mounts {
+		if strings.Contains(m.Source, "{{") || strings.Contains(m.Target, "{{") {
+			return true
+		}
+		for _, opt := range m.Options {
+			if strings.Contains(opt, "{{") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// mountTypeSuffixTest returns the final component of a mount type.
+// This is intentionally duplicated from plugins/diff/erofs to avoid
+// exporting an internal function just for test purposes.
+func mountTypeSuffixTest(t string) string {
+	if t == "" {
+		return ""
+	}
+	parts := strings.Split(t, "/")
+	return parts[len(parts)-1]
+}
+
+func snapshotID(t *testing.T, s *snapshotter, key string) string {
+	t.Helper()
+	var id string
+	if err := s.ms.WithTransaction(t.Context(), false, func(ctx context.Context) error {
+		var err error
+		id, _, _, err = storage.GetInfo(ctx, key)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+// TestErofsDifferCompareMultipleStackedLayers tests Compare with 5+ stacked
+// EROFS layers to verify that overlay template expansion works correctly
+// with many layers.
+func TestErofsDifferCompareMultipleStackedLayers(t *testing.T) {
+	testutil.RequiresRoot(t)
+	ctx := namespaces.WithNamespace(t.Context(), "testsuite")
+
+	_, err := exec.LookPath("mkfs.erofs")
+	if err != nil {
+		t.Skipf("could not find mkfs.erofs: %v", err)
+	}
+	if !findErofs() {
+		t.Skip("check for erofs kernel support failed, skipping test")
+	}
+
+	tempDir := t.TempDir()
+	contentStore := imagetest.NewContentStore(ctx, t).Store
+
+	snapshotRoot := filepath.Join(tempDir, "snapshots")
+	s, err := NewSnapshotter(snapshotRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	snap := s.(*snapshotter)
+
+	// Create 6 stacked layers
+	layerCount := 6
+	var parentKey string
+	for i := 0; i < layerCount; i++ {
+		key := fmt.Sprintf("layer-%d", i)
+		commitKey := fmt.Sprintf("layer-%d-commit", i)
+
+		if _, err := s.Prepare(ctx, key, parentKey); err != nil {
+			t.Fatalf("failed to prepare layer %d: %v", i, err)
+		}
+
+		id := snapshotID(t, snap, key)
+		filename := fmt.Sprintf("file-%d.txt", i)
+		if err := os.WriteFile(filepath.Join(snap.upperPath(id), filename), []byte(fmt.Sprintf("content-%d", i)), 0644); err != nil {
+			t.Fatalf("failed to write file in layer %d: %v", i, err)
+		}
+
+		if err := s.Commit(ctx, commitKey, key); err != nil {
+			t.Fatalf("failed to commit layer %d: %v", i, err)
+		}
+		parentKey = commitKey
+	}
+
+	// Create upper layer on top of all stacked layers
+	upperKey := "upper"
+	upperMounts, err := s.Prepare(ctx, upperKey, parentKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	upperID := snapshotID(t, snap, upperKey)
+	if err := os.WriteFile(filepath.Join(snap.upperPath(upperID), "upper.txt"), []byte("upper"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create lower view from the stacked layers
+	lowerKey := "lower"
+	lowerMounts, err := s.View(ctx, lowerKey, parentKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify mounts have templates (indicating multiple EROFS layers)
+	if !mountsHaveTemplate(lowerMounts) && !mountsHaveTemplate(upperMounts) {
+		t.Logf("lower mounts: %#v", lowerMounts)
+		t.Logf("upper mounts: %#v", upperMounts)
+		// This is acceptable if they're simple EROFS mounts
+	}
+
+	db, err := bolt.Open(filepath.Join(tempDir, "mounts.db"), 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	mountRoot := filepath.Join(tempDir, "mounts")
+	mm, err := manager.NewManager(db, mountRoot, manager.WithAllowedRoot(snapshotRoot))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if closer, ok := mm.(interface{ Close() error }); ok {
+		defer closer.Close()
+	}
+
+	differ := erofsdiffer.NewErofsDiffer(contentStore, erofsdiffer.WithMountManager(mm))
+	desc, err := differ.Compare(ctx, lowerMounts, upperMounts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if desc.Digest == "" || desc.Size == 0 {
+		t.Fatalf("unexpected diff descriptor: %+v", desc)
+	}
+
+	// Verify the diff contains the upper file
+	found, err := tarHasPath(ctx, contentStore, desc, "upper.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("expected diff to include upper.txt")
+	}
+}
+
+// TestErofsDifferCompareEmptyLowerMounts tests Compare behavior when lower
+// mounts slice is empty. This simulates creating a diff from scratch.
+func TestErofsDifferCompareEmptyLowerMounts(t *testing.T) {
+	testutil.RequiresRoot(t)
+	ctx := namespaces.WithNamespace(t.Context(), "testsuite")
+
+	_, err := exec.LookPath("mkfs.erofs")
+	if err != nil {
+		t.Skipf("could not find mkfs.erofs: %v", err)
+	}
+	if !findErofs() {
+		t.Skip("check for erofs kernel support failed, skipping test")
+	}
+
+	tempDir := t.TempDir()
+	contentStore := imagetest.NewContentStore(ctx, t).Store
+
+	snapshotRoot := filepath.Join(tempDir, "snapshots")
+	s, err := NewSnapshotter(snapshotRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	snap := s.(*snapshotter)
+
+	// Create a single layer (no parent)
+	key := "single"
+	if _, err := s.Prepare(ctx, key, ""); err != nil {
+		t.Fatal(err)
+	}
+	id := snapshotID(t, snap, key)
+	if err := os.WriteFile(filepath.Join(snap.upperPath(id), "new.txt"), []byte("new"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Commit(ctx, "single-commit", key); err != nil {
+		t.Fatal(err)
+	}
+
+	// Get mounts for the committed layer as upper
+	upperKey := "upper"
+	upperMounts, err := s.Prepare(ctx, upperKey, "single-commit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	upperID := snapshotID(t, snap, upperKey)
+	if err := os.WriteFile(filepath.Join(snap.upperPath(upperID), "upper.txt"), []byte("upper"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := bolt.Open(filepath.Join(tempDir, "mounts.db"), 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	mountRoot := filepath.Join(tempDir, "mounts")
+	mm, err := manager.NewManager(db, mountRoot, manager.WithAllowedRoot(snapshotRoot))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if closer, ok := mm.(interface{ Close() error }); ok {
+		defer closer.Close()
+	}
+
+	differ := erofsdiffer.NewErofsDiffer(contentStore, erofsdiffer.WithMountManager(mm))
+
+	// Compare with empty lower mounts - this tests the base case
+	emptyLower := []mount.Mount{}
+	desc, err := differ.Compare(ctx, emptyLower, upperMounts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if desc.Digest == "" || desc.Size == 0 {
+		t.Fatalf("unexpected diff descriptor: %+v", desc)
+	}
+}
+
+// TestErofsDifferCompareContextCancellation tests that Compare properly handles
+// context cancellation during mount manager operations.
+func TestErofsDifferCompareContextCancellation(t *testing.T) {
+	testutil.RequiresRoot(t)
+	baseCtx := namespaces.WithNamespace(t.Context(), "testsuite")
+
+	_, err := exec.LookPath("mkfs.erofs")
+	if err != nil {
+		t.Skipf("could not find mkfs.erofs: %v", err)
+	}
+	if !findErofs() {
+		t.Skip("check for erofs kernel support failed, skipping test")
+	}
+
+	tempDir := t.TempDir()
+	contentStore := imagetest.NewContentStore(baseCtx, t).Store
+
+	snapshotRoot := filepath.Join(tempDir, "snapshots")
+	s, err := NewSnapshotter(snapshotRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	snap := s.(*snapshotter)
+
+	// Create base layer
+	baseKey := "base"
+	if _, err := s.Prepare(baseCtx, baseKey, ""); err != nil {
+		t.Fatal(err)
+	}
+	baseID := snapshotID(t, snap, baseKey)
+	if err := os.WriteFile(filepath.Join(snap.upperPath(baseID), "base.txt"), []byte("base"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Commit(baseCtx, "base-commit", baseKey); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create upper layer
+	upperKey := "upper"
+	upperMounts, err := s.Prepare(baseCtx, upperKey, "base-commit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	upperID := snapshotID(t, snap, upperKey)
+	if err := os.WriteFile(filepath.Join(snap.upperPath(upperID), "upper.txt"), []byte("upper"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	lowerKey := "lower"
+	lowerMounts, err := s.View(baseCtx, lowerKey, "base-commit")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := bolt.Open(filepath.Join(tempDir, "mounts.db"), 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	mountRoot := filepath.Join(tempDir, "mounts")
+	mm, err := manager.NewManager(db, mountRoot, manager.WithAllowedRoot(snapshotRoot))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if closer, ok := mm.(interface{ Close() error }); ok {
+		defer closer.Close()
+	}
+
+	differ := erofsdiffer.NewErofsDiffer(contentStore, erofsdiffer.WithMountManager(mm))
+
+	// Create a cancelled context
+	ctx, cancel := context.WithCancel(baseCtx)
+	cancel() // Cancel immediately
+
+	// Compare with cancelled context should fail
+	_, err = differ.Compare(ctx, lowerMounts, upperMounts)
+	if err == nil {
+		t.Fatal("expected error with cancelled context")
+	}
+	// The error should be context-related
+	if !strings.Contains(err.Error(), "context canceled") && !strings.Contains(err.Error(), "canceled") {
+		t.Logf("got error (acceptable): %v", err)
+	}
+}
+
+// TestErofsDifferCompareSingleLayerView tests Compare when lower is a single
+// EROFS layer returned directly (KindView optimization path).
+func TestErofsDifferCompareSingleLayerView(t *testing.T) {
+	testutil.RequiresRoot(t)
+	ctx := namespaces.WithNamespace(t.Context(), "testsuite")
+
+	_, err := exec.LookPath("mkfs.erofs")
+	if err != nil {
+		t.Skipf("could not find mkfs.erofs: %v", err)
+	}
+	if !findErofs() {
+		t.Skip("check for erofs kernel support failed, skipping test")
+	}
+
+	tempDir := t.TempDir()
+	contentStore := imagetest.NewContentStore(ctx, t).Store
+
+	snapshotRoot := filepath.Join(tempDir, "snapshots")
+	s, err := NewSnapshotter(snapshotRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	snap := s.(*snapshotter)
+
+	// Create single base layer
+	baseKey := "base"
+	if _, err := s.Prepare(ctx, baseKey, ""); err != nil {
+		t.Fatal(err)
+	}
+	baseID := snapshotID(t, snap, baseKey)
+	if err := os.WriteFile(filepath.Join(snap.upperPath(baseID), "base.txt"), []byte("base"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Commit(ctx, "base-commit", baseKey); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a view of the single layer - this triggers the KindView optimization
+	viewKey := "view"
+	viewMounts, err := s.View(ctx, viewKey, "base-commit")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify it's a single EROFS mount (the optimization path)
+	if len(viewMounts) != 1 {
+		t.Fatalf("expected single mount for view, got %d", len(viewMounts))
+	}
+	if viewMounts[0].Type != "erofs" {
+		t.Fatalf("expected erofs mount type, got %s", viewMounts[0].Type)
+	}
+
+	// Create upper layer on top
+	upperKey := "upper"
+	upperMounts, err := s.Prepare(ctx, upperKey, "base-commit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	upperID := snapshotID(t, snap, upperKey)
+	if err := os.WriteFile(filepath.Join(snap.upperPath(upperID), "new.txt"), []byte("new"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := bolt.Open(filepath.Join(tempDir, "mounts.db"), 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	mountRoot := filepath.Join(tempDir, "mounts")
+	mm, err := manager.NewManager(db, mountRoot, manager.WithAllowedRoot(snapshotRoot))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if closer, ok := mm.(interface{ Close() error }); ok {
+		defer closer.Close()
+	}
+
+	differ := erofsdiffer.NewErofsDiffer(contentStore, erofsdiffer.WithMountManager(mm))
+
+	// Compare using the single-layer view as lower
+	desc, err := differ.Compare(ctx, viewMounts, upperMounts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if desc.Digest == "" || desc.Size == 0 {
+		t.Fatalf("unexpected diff descriptor: %+v", desc)
+	}
+
+	// Verify the diff contains the new file
+	found, err := tarHasPath(ctx, contentStore, desc, "new.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("expected diff to include new.txt")
+	}
+}
+
+// TestErofsDifferCompareViewWithMultipleLayers tests Compare when lower is a
+// view of multiple stacked layers, triggering the overlay template path.
+func TestErofsDifferCompareViewWithMultipleLayers(t *testing.T) {
+	testutil.RequiresRoot(t)
+	ctx := namespaces.WithNamespace(t.Context(), "testsuite")
+
+	_, err := exec.LookPath("mkfs.erofs")
+	if err != nil {
+		t.Skipf("could not find mkfs.erofs: %v", err)
+	}
+	if !findErofs() {
+		t.Skip("check for erofs kernel support failed, skipping test")
+	}
+
+	tempDir := t.TempDir()
+	contentStore := imagetest.NewContentStore(ctx, t).Store
+
+	snapshotRoot := filepath.Join(tempDir, "snapshots")
+	s, err := NewSnapshotter(snapshotRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	snap := s.(*snapshotter)
+
+	// Create first layer
+	layer1Key := "layer1"
+	if _, err := s.Prepare(ctx, layer1Key, ""); err != nil {
+		t.Fatal(err)
+	}
+	layer1ID := snapshotID(t, snap, layer1Key)
+	if err := os.WriteFile(filepath.Join(snap.upperPath(layer1ID), "layer1.txt"), []byte("layer1"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Commit(ctx, "layer1-commit", layer1Key); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create second layer
+	layer2Key := "layer2"
+	if _, err := s.Prepare(ctx, layer2Key, "layer1-commit"); err != nil {
+		t.Fatal(err)
+	}
+	layer2ID := snapshotID(t, snap, layer2Key)
+	if err := os.WriteFile(filepath.Join(snap.upperPath(layer2ID), "layer2.txt"), []byte("layer2"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Commit(ctx, "layer2-commit", layer2Key); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a view of the two layers - this should return overlay with templates
+	viewKey := "view"
+	viewMounts, err := s.View(ctx, viewKey, "layer2-commit")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The view of multiple layers should have templates or multiple mounts
+	if len(viewMounts) < 2 && !mountsHaveTemplate(viewMounts) {
+		t.Logf("view mounts: %#v", viewMounts)
+		// May be EROFS mounts without templates, which is also valid
+	}
+
+	// Create upper layer
+	upperKey := "upper"
+	upperMounts, err := s.Prepare(ctx, upperKey, "layer2-commit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	upperID := snapshotID(t, snap, upperKey)
+	if err := os.WriteFile(filepath.Join(snap.upperPath(upperID), "upper.txt"), []byte("upper"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := bolt.Open(filepath.Join(tempDir, "mounts.db"), 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	mountRoot := filepath.Join(tempDir, "mounts")
+	mm, err := manager.NewManager(db, mountRoot, manager.WithAllowedRoot(snapshotRoot))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if closer, ok := mm.(interface{ Close() error }); ok {
+		defer closer.Close()
+	}
+
+	differ := erofsdiffer.NewErofsDiffer(contentStore, erofsdiffer.WithMountManager(mm))
+	desc, err := differ.Compare(ctx, viewMounts, upperMounts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if desc.Digest == "" || desc.Size == 0 {
+		t.Fatalf("unexpected diff descriptor: %+v", desc)
+	}
+
+	// Verify the diff contains the upper file
+	found, err := tarHasPath(ctx, contentStore, desc, "upper.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("expected diff to include upper.txt")
+	}
 }

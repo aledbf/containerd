@@ -53,6 +53,7 @@ type erofsDiff struct {
 	// enableTarIndex enables generating tar index for tar content
 	// instead of fully converting the tar to EROFS format
 	enableTarIndex bool
+	mm             mount.Manager
 }
 
 // DifferOpt is an option for configuring the erofs differ
@@ -69,6 +70,13 @@ func WithMkfsOptions(opts []string) DifferOpt {
 func WithTarIndexMode() DifferOpt {
 	return func(d *erofsDiff) {
 		d.enableTarIndex = true
+	}
+}
+
+// WithMountManager sets the mount manager used to resolve formatted mounts.
+func WithMountManager(mm mount.Manager) DifferOpt {
+	return func(d *erofsDiff) {
+		d.mm = mm
 	}
 }
 

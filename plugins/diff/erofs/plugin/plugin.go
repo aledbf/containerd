@@ -17,6 +17,7 @@
 package plugin
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/containerd/platforms"
@@ -24,6 +25,7 @@ import (
 	"github.com/containerd/plugin/registry"
 
 	"github.com/containerd/containerd/v2/core/metadata"
+	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/internal/erofsutils"
 	"github.com/containerd/containerd/v2/plugins"
 	"github.com/containerd/containerd/v2/plugins/diff/erofs"
@@ -60,6 +62,12 @@ func init() {
 			if err != nil {
 				return nil, err
 			}
+			var mm mount.Manager
+			if mmI, err := ic.GetSingle(plugins.MountManagerPlugin); err == nil {
+				mm = mmI.(mount.Manager)
+			} else if !errors.Is(err, plugin.ErrPluginNotFound) {
+				return nil, err
+			}
 
 			p := platforms.DefaultSpec()
 			p.OS = "linux"
@@ -75,6 +83,10 @@ func init() {
 
 			if config.EnableTarIndex {
 				opts = append(opts, erofs.WithTarIndexMode())
+			}
+
+			if mm != nil {
+				opts = append(opts, erofs.WithMountManager(mm))
 			}
 
 			return erofs.NewErofsDiffer(cs, opts...), nil
