@@ -246,7 +246,10 @@ func withLowerMount(ctx context.Context, lower []mount.Mount, mm mount.Manager, 
 			return err
 		}
 		defer func() {
-			if derr := mm.Deactivate(ctx, name); derr != nil {
+			// Use a detached context for cleanup to ensure deactivation succeeds
+			// even if the parent context is cancelled.
+			cleanupCtx := context.WithoutCancel(ctx)
+			if derr := mm.Deactivate(cleanupCtx, name); derr != nil {
 				log.G(ctx).WithError(derr).Warnf("failed to deactivate lower mount %s", name)
 			}
 		}()
@@ -287,7 +290,10 @@ func withUpperMount(ctx context.Context, upper []mount.Mount, mm mount.Manager, 
 			return err
 		}
 		defer func() {
-			if derr := mm.Deactivate(ctx, name); derr != nil {
+			// Use a detached context for cleanup to ensure deactivation succeeds
+			// even if the parent context is cancelled.
+			cleanupCtx := context.WithoutCancel(ctx)
+			if derr := mm.Deactivate(cleanupCtx, name); derr != nil {
 				log.G(ctx).WithError(derr).Warnf("failed to deactivate upper mount %s", name)
 			}
 		}()

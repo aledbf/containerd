@@ -373,6 +373,11 @@ func (s *snapshotter) mounts(snap storage.Snapshot, _ snapshots.Info) ([]mount.M
 		mounts = append(mounts, m)
 	}
 	if (len(mounts) - first) == 1 {
+		// Fast-path: for KindView with a single lower mount (e.g., after fsmeta merge),
+		// return the EROFS mounts directly without requiring mount manager resolution.
+		if snap.Kind == snapshots.KindView {
+			return mounts, nil
+		}
 		options = append(options, fmt.Sprintf("lowerdir={{ mount %d }}", first))
 	} else {
 		options = append(options, fmt.Sprintf("lowerdir={{ overlay %d %d }}", first, len(mounts)-1))
