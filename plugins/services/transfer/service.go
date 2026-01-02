@@ -18,6 +18,7 @@ package transfer
 
 import (
 	"context"
+	"fmt"
 
 	transferapi "github.com/containerd/containerd/api/services/transfer/v1"
 	"github.com/containerd/containerd/api/types"
@@ -133,6 +134,11 @@ func (s *service) Transfer(ctx context.Context, req *transferapi.TransferRequest
 	}
 
 	for _, t := range s.transferrers {
+		log.G(ctx).WithFields(log.Fields{
+			"source": fmt.Sprintf("%T", src),
+			"dest":   fmt.Sprintf("%T", dst),
+			"xf":     fmt.Sprintf("%T", t),
+		}).Debug("transfer attempt")
 		if err := t.Transfer(ctx, src, dst, transferOpts...); err == nil {
 			return empty, nil
 		} else if !errdefs.IsNotImplemented(err) {

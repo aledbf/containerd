@@ -47,6 +47,7 @@ func init() {
 		ID:   "erofs",
 		Requires: []plugin.Type{
 			plugins.MetadataPlugin,
+			plugins.MountManagerPlugin,
 		},
 		Config: &Config{},
 		InitFn: func(ic *plugin.InitContext) (interface{}, error) {
@@ -62,12 +63,14 @@ func init() {
 			if err != nil {
 				return nil, err
 			}
-			var mm mount.Manager
-			if mmI, err := ic.GetSingle(plugins.MountManagerPlugin); err == nil {
-				mm = mmI.(mount.Manager)
-			} else if !errors.Is(err, plugin.ErrPluginNotFound) {
+			mmI, err := ic.GetSingle(plugins.MountManagerPlugin)
+			if err != nil {
+				if errors.Is(err, plugin.ErrPluginNotFound) {
+					return nil, fmt.Errorf("mount manager plugin is required for erofs differ: %w", err)
+				}
 				return nil, err
 			}
+			mm := mmI.(mount.Manager)
 
 			p := platforms.DefaultSpec()
 			p.OS = "linux"
@@ -85,9 +88,7 @@ func init() {
 				opts = append(opts, erofs.WithTarIndexMode())
 			}
 
-			if mm != nil {
-				opts = append(opts, erofs.WithMountManager(mm))
-			}
+			opts = append(opts, erofs.WithMountManager(mm))
 
 			return erofs.NewErofsDiffer(cs, opts...), nil
 		},

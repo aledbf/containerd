@@ -41,6 +41,10 @@ func cleanupUpper(upper string) error {
 	return nil
 }
 
+func cleanupActiveMounts(upper string) error {
+	return nil
+}
+
 func upperDirectoryPermission(p, parent string) error {
 	return nil
 }

@@ -94,6 +94,25 @@ func cleanupUpper(upper string) error {
 	return nil
 }
 
+func cleanupActiveMounts(upper string) error {
+	merged := filepath.Join(upper, "merged")
+	lower := filepath.Join(upper, "lower")
+	rw := filepath.Join(upper, "rw")
+
+	_ = mount.UnmountAll(merged, 0)
+
+	if entries, err := os.ReadDir(lower); err == nil {
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			_ = mount.UnmountAll(filepath.Join(lower, e.Name()), 0)
+		}
+	}
+	_ = mount.UnmountAll(rw, 0)
+	return nil
+}
+
 func convertDirToErofs(ctx context.Context, layerBlob, upperDir string) error {
 	err := erofsutils.ConvertErofs(ctx, layerBlob, upperDir, nil)
 	if err != nil {
