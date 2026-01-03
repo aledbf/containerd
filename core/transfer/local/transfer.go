@@ -26,7 +26,6 @@ import (
 	"golang.org/x/sync/semaphore"
 
 	"github.com/containerd/errdefs"
-	"github.com/containerd/log"
 
 	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/images"
@@ -71,22 +70,13 @@ func (ts *localTransferService) Transfer(ctx context.Context, src interface{}, d
 	for _, opt := range opts {
 		opt(topts)
 	}
-	log.G(ctx).WithFields(log.Fields{
-		"source": fmt.Sprintf("%T", src),
-		"dest":   fmt.Sprintf("%T", dest),
-	}).Debug("local transfer dispatch")
 
 	// Figure out matrix of whether source destination combination is supported
 	switch s := src.(type) {
 	case transfer.ImageFetcher:
 		switch d := dest.(type) {
 		case transfer.ImageStorer:
-			err := ts.pull(ctx, s, d, topts)
-			if err != nil {
-				log.G(ctx).WithError(err).WithField("not_implemented", errdefs.IsNotImplemented(err)).
-					Debug("local transfer pull failed")
-			}
-			return err
+			return ts.pull(ctx, s, d, topts)
 		}
 	case transfer.ImageGetter:
 		switch d := dest.(type) {

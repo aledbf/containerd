@@ -30,8 +30,6 @@ import (
 	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
-	"github.com/containerd/errdefs"
-
 	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/diff"
 	"github.com/containerd/containerd/v2/core/images"
@@ -146,11 +144,6 @@ func (s erofsDiff) Apply(ctx context.Context, desc ocispec.Descriptor, mounts []
 
 	layer, err := erofsutils.MountsToLayer(mounts)
 	if err != nil {
-		if errdefs.IsNotImplemented(err) {
-			log.G(ctx).WithFields(log.Fields{
-				"mounts": summarizeMounts(mounts),
-			}).WithError(err).Debug("erofs diff apply: mounts not supported")
-		}
 		return emptyDesc, err
 	}
 
@@ -223,14 +216,6 @@ func (s erofsDiff) Apply(ctx context.Context, desc ocispec.Descriptor, mounts []
 type readCounter struct {
 	r io.Reader
 	c int64
-}
-
-func summarizeMounts(mounts []mount.Mount) []string {
-	out := make([]string, 0, len(mounts))
-	for _, m := range mounts {
-		out = append(out, fmt.Sprintf("%s:%s", m.Type, m.Source))
-	}
-	return out
 }
 
 func (rc *readCounter) Read(p []byte) (n int, err error) {

@@ -21,9 +21,11 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/containerd/continuity/fs"
@@ -104,7 +106,11 @@ type snapshotter struct {
 	defaultWritable  int64
 	blockMode        bool
 	fsMergeThreshold uint
+	prepareMu        sync.Mutex
+	prepareMounts    map[string]struct{}
 }
+
+const extractMarker = ".erofs-extract"
 
 // NewSnapshotter returns a Snapshotter which uses EROFS+OverlayFS. The layers
 // are stored under the provided root. A metadata file is stored under the root.
@@ -161,6 +167,7 @@ func NewSnapshotter(root string, opts ...Opt) (snapshots.Snapshotter, error) {
 		defaultWritable:  config.defaultSize,
 		blockMode:        config.defaultSize > 0,
 		fsMergeThreshold: config.fsMergeThreshold,
+		prepareMounts:    map[string]struct{}{},
 	}, nil
 }
 
@@ -272,6 +279,10 @@ func (s *snapshotter) prepareDirectory(ctx context.Context, snapshotDir string, 
 }
 
 func (s *snapshotter) mountFsMeta(snap storage.Snapshot, id int) (mount.Mount, bool) {
+	if s.blockMode {
+		return mount.Mount{}, false
+	}
+
 	mergedMeta := s.fsMetaPath(snap.ParentIDs[id])
 	if fi, err := os.Stat(mergedMeta); err != nil || fi.Size() == 0 {
 		return mount.Mount{}, false
@@ -283,8 +294,12 @@ func (s *snapshotter) mountFsMeta(snap storage.Snapshot, id int) (mount.Mount, b
 		Options: []string{"ro", "loop"},
 	}
 	for j := len(snap.ParentIDs) - 1; j >= id; j-- {
-		path := s.layerBlobPath(snap.ParentIDs[j])
-		m.Options = append(m.Options, "device="+path)
+		blob := s.layerBlobPath(snap.ParentIDs[j])
+		fi, err := os.Stat(blob)
+		if err != nil || fi.Size() == 0 {
+			return mount.Mount{}, false
+		}
+		m.Options = append(m.Options, "device="+blob)
 	}
 	return m, true
 }
@@ -293,6 +308,9 @@ func (s *snapshotter) mounts(snap storage.Snapshot, info snapshots.Info) ([]moun
 	var options []string
 
 	if s.blockMode && snap.Kind == snapshots.KindActive {
+		if s.isExtractSnapshot(snap.ID) {
+			return s.diffMounts(snap)
+		}
 		return s.activeMounts(snap)
 	}
 
@@ -448,6 +466,174 @@ func (s *snapshotter) mounts(snap storage.Snapshot, info snapshots.Info) ([]moun
 	}), nil
 }
 
+func (s *snapshotter) runtimeMounts(snap storage.Snapshot, info snapshots.Info) ([]mount.Mount, error) {
+	var options []string
+
+	if s.blockMode && snap.Kind == snapshots.KindActive && s.isExtractSnapshot(snap.ID) {
+		return s.diffMounts(snap)
+	}
+
+	if len(snap.ParentIDs) == 0 {
+		if layerBlob, err := s.lowerPath(snap.ID); err == nil {
+			if snap.Kind != snapshots.KindView {
+				return nil, fmt.Errorf("only works for snapshots.KindView on a committed snapshot: %w", err)
+			}
+			if s.enableFsverity {
+				if err := s.verifyFsverity(layerBlob); err != nil {
+					return nil, err
+				}
+			}
+			return []mount.Mount{
+				{
+					Source:  layerBlob,
+					Type:    "erofs",
+					Options: []string{"ro", "loop"},
+				},
+			}, nil
+		}
+		// if we only have one layer/no parents then just return a bind mount as overlay
+		// will not work
+		roFlag := "rw"
+		if snap.Kind == snapshots.KindView {
+			roFlag = "ro"
+		}
+		if s.blockMode {
+			// The writable layer file is pre-created by createWritableLayer()
+			// but we still use mkfs/ext4 type so the mount manager creates upper dir
+			return []mount.Mount{
+				{
+					Source: s.writablePath(snap.ID),
+					Type:   "mkfs/ext4",
+					Options: []string{
+						"X-containerd.mkfs.fs=ext4",
+						// TODO: Get size from snapshot labels
+						fmt.Sprintf("X-containerd.mkfs.size=%d", s.defaultWritable),
+						// TODO: Add UUID
+						roFlag,
+						"loop",
+					},
+				},
+				{
+					Source: "{{ mount 0 }}/upper",
+					Type:   "format/mkdir/bind",
+					Options: append(options,
+						"X-containerd.mkdir.path={{ mount 0 }}/upper:0755",
+						roFlag,
+						"rbind",
+					),
+				},
+			}, nil
+		}
+		return []mount.Mount{
+			{
+				Source: s.upperPath(snap.ID),
+				Type:   "bind",
+				Options: append(options,
+					roFlag,
+					"rbind",
+				),
+			},
+		}, nil
+	}
+
+	var mounts []mount.Mount
+	if snap.Kind == snapshots.KindActive {
+		if s.blockMode {
+			// The writable layer file is pre-created by createWritableLayer()
+			// but we still use mkfs/ext4 type so the mount manager creates dirs
+			mounts = append(mounts, mount.Mount{
+				Source: s.writablePath(snap.ID),
+				Type:   "mkfs/ext4",
+				Options: []string{
+					"X-containerd.mkfs.fs=ext4",
+					fmt.Sprintf("X-containerd.mkfs.size=%d", s.defaultWritable),
+					"rw",
+					"loop",
+				},
+			})
+			options = append(options,
+				"X-containerd.mkdir.path={{ mount 0 }}/upper:0755",
+				"X-containerd.mkdir.path={{ mount 0 }}/work:0755",
+				"workdir={{ mount 0 }}/work",
+				"upperdir={{ mount 0 }}/upper",
+			)
+		} else {
+			options = append(options,
+				fmt.Sprintf("workdir=%s", s.workPath(snap.ID)),
+				fmt.Sprintf("upperdir=%s", s.upperPath(snap.ID)),
+			)
+		}
+	} else if len(snap.ParentIDs) == 1 {
+		layerBlob, err := s.lowerPath(snap.ParentIDs[0])
+		if err != nil {
+			return nil, err
+		}
+		return []mount.Mount{
+			{
+				Source:  layerBlob,
+				Type:    "erofs",
+				Options: []string{"ro", "loop"},
+			},
+		}, nil
+	}
+
+	first := len(mounts)
+	for i := range snap.ParentIDs {
+		// If a merged fsmeta is valid for this layer, skip the remaining bottom layers.
+		// Why? Because bottom layers have been flattened with the thin fsmeta.
+		if s.fsMergeThreshold > 0 {
+			if m, ok := s.mountFsMeta(snap, i); ok {
+				mounts = append(mounts, m)
+				first = len(mounts) - 1
+				break
+			}
+		}
+
+		layerBlob, err := s.lowerPath(snap.ParentIDs[i])
+		if err != nil {
+			return nil, err
+		}
+
+		m := mount.Mount{
+			Source:  layerBlob,
+			Type:    "erofs",
+			Options: []string{"ro", "loop"},
+		}
+
+		mounts = append(mounts, m)
+	}
+	if (len(mounts) - first) == 1 {
+		// Fast-path: for KindView with a single lower mount (e.g., after fsmeta merge),
+		// return the EROFS mounts directly without requiring mount manager resolution.
+		if snap.Kind == snapshots.KindView {
+			return mounts, nil
+		}
+		options = append(options, fmt.Sprintf("lowerdir={{ mount %d }}", first))
+	} else {
+		options = append(options, fmt.Sprintf("lowerdir={{ overlay %d %d }}", first, len(mounts)-1))
+	}
+	if snap.Kind == snapshots.KindView {
+		options = append(options, "ro")
+	}
+	options = append(options, s.ovlOptions...)
+
+	return append(mounts, mount.Mount{
+		Type:    "format/mkdir/overlay",
+		Source:  "overlay",
+		Options: options,
+	}), nil
+}
+
+func (s *snapshotter) isExtractSnapshot(id string) bool {
+	marker := filepath.Join(s.root, "snapshots", id, extractMarker)
+	_, err := os.Stat(marker)
+	return err == nil
+}
+
+func isExtractKey(key string) bool {
+	return strings.HasPrefix(path.Base(key), snapshots.UnpackKeyPrefix)
+}
+
 func (s *snapshotter) activeMounts(snap storage.Snapshot) (_ []mount.Mount, err error) {
 	upperRoot := s.upperPath(snap.ID)
 	rwRoot := filepath.Join(upperRoot, "rw")
@@ -506,13 +692,15 @@ func (s *snapshotter) activeMounts(snap storage.Snapshot) (_ []mount.Mount, err 
 		}, nil
 	}
 
-	if _, err := os.Stat(filepath.Join(upperRoot, ".erofslayer")); err != nil {
-		if os.IsNotExist(err) {
-			if err := os.WriteFile(filepath.Join(upperRoot, ".erofslayer"), []byte{}, 0644); err != nil {
-				return nil, fmt.Errorf("failed to create erofs marker: %w", err)
+	for _, markerRoot := range []string{upperRoot, rwRoot} {
+		if _, err := os.Stat(filepath.Join(markerRoot, ".erofslayer")); err != nil {
+			if os.IsNotExist(err) {
+				if err := os.WriteFile(filepath.Join(markerRoot, ".erofslayer"), []byte{}, 0644); err != nil {
+					return nil, fmt.Errorf("failed to create erofs marker: %w", err)
+				}
+			} else {
+				return nil, fmt.Errorf("failed to stat erofs marker: %w", err)
 			}
-		} else {
-			return nil, fmt.Errorf("failed to stat erofs marker: %w", err)
 		}
 	}
 
@@ -588,6 +776,30 @@ func (s *snapshotter) activeMounts(snap storage.Snapshot) (_ []mount.Mount, err 
 	}, nil
 }
 
+func (s *snapshotter) diffMounts(snap storage.Snapshot) (_ []mount.Mount, err error) {
+	upperRoot := s.upperPath(snap.ID)
+	layerRoot := filepath.Dir(upperRoot)
+	if err := os.MkdirAll(upperRoot, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create upper root: %w", err)
+	}
+	if _, err := os.Stat(filepath.Join(layerRoot, ".erofslayer")); err != nil {
+		if os.IsNotExist(err) {
+			if err := os.WriteFile(filepath.Join(layerRoot, ".erofslayer"), []byte{}, 0644); err != nil {
+				return nil, fmt.Errorf("failed to create erofs marker: %w", err)
+			}
+		} else {
+			return nil, fmt.Errorf("failed to stat erofs marker: %w", err)
+		}
+	}
+	return []mount.Mount{
+		{
+			Type:    "bind",
+			Source:  upperRoot,
+			Options: []string{"rw", "rbind"},
+		},
+	}, nil
+}
+
 func (s *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, key, parent string, opts []snapshots.Opt) (_ []mount.Mount, err error) {
 	var (
 		snap     storage.Snapshot
@@ -644,9 +856,16 @@ func (s *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 		return nil, err
 	}
 
+	if isExtractKey(key) {
+		marker := filepath.Join(path, extractMarker)
+		if err := os.WriteFile(marker, []byte{}, 0644); err != nil {
+			return nil, fmt.Errorf("failed to create extract marker: %w", err)
+		}
+	}
+
 	// Generate fsmeta outside of the transaction since it's unnecessary.
 	// Also ignore all errors since it's a nice-to-have stuff.
-	if !strings.Contains(key, snapshots.UnpackKeyPrefix) {
+	if !isExtractKey(key) {
 		s.generateFsMeta(ctx, snap.ParentIDs)
 	}
 
@@ -654,10 +873,13 @@ func (s *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 	// This avoids the need for lazy mkfs/ext4 processing which requires a mount
 	// manager and doesn't work well with VM-based runtimes that need the file
 	// to exist before mounting.
-	if kind == snapshots.KindActive && s.blockMode {
+	if kind == snapshots.KindActive && s.blockMode && !isExtractKey(key) {
 		if err := s.createWritableLayer(ctx, snap.ID); err != nil {
 			return nil, fmt.Errorf("failed to create writable layer: %w", err)
 		}
+		s.prepareMu.Lock()
+		s.prepareMounts[key] = struct{}{}
+		s.prepareMu.Unlock()
 	}
 
 	return s.mounts(snap, info)
@@ -830,7 +1052,27 @@ func (s *snapshotter) Mounts(ctx context.Context, key string) (_ []mount.Mount, 
 	}); err != nil {
 		return nil, err
 	}
-	return s.mounts(snap, info)
+	var mounts []mount.Mount
+	if s.blockMode && snap.Kind == snapshots.KindActive && !s.isExtractSnapshot(snap.ID) {
+		s.prepareMu.Lock()
+		_, prepared := s.prepareMounts[key]
+		if prepared {
+			delete(s.prepareMounts, key)
+		}
+		s.prepareMu.Unlock()
+
+		if prepared {
+			mounts, err = s.activeMounts(snap)
+		} else {
+			mounts, err = s.runtimeMounts(snap, info)
+		}
+	} else {
+		mounts, err = s.mounts(snap, info)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return mounts, nil
 }
 
 func (s *snapshotter) getCleanupDirectories(ctx context.Context) ([]string, error) {
@@ -895,6 +1137,9 @@ func (s *snapshotter) Remove(ctx context.Context, key string) (err error) {
 		if err != nil {
 			return fmt.Errorf("failed to remove snapshot %s: %w", key, err)
 		}
+		s.prepareMu.Lock()
+		delete(s.prepareMounts, key)
+		s.prepareMu.Unlock()
 
 		removals, err = s.getCleanupDirectories(ctx)
 		if err != nil {
@@ -910,6 +1155,31 @@ func (s *snapshotter) Remove(ctx context.Context, key string) (err error) {
 		}
 		return nil
 	})
+}
+
+func (s *snapshotter) Cleanup(ctx context.Context) (err error) {
+	var removals []string
+	if err := s.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
+		var err error
+		removals, err = s.getCleanupDirectories(ctx)
+		return err
+	}); err != nil {
+		return err
+	}
+
+	cleanup := cleanupUpper
+	if s.blockMode {
+		cleanup = cleanupActiveMounts
+	}
+
+	for _, dir := range removals {
+		_ = cleanup(filepath.Join(dir, "fs"))
+		_ = setImmutable(filepath.Join(dir, "layer.erofs"), false)
+		if err := os.RemoveAll(dir); err != nil {
+			log.G(ctx).WithError(err).WithField("path", dir).Warn("failed to remove directory")
+		}
+	}
+	return nil
 }
 
 func (s *snapshotter) Stat(ctx context.Context, key string) (info snapshots.Info, err error) {

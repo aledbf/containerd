@@ -1665,3 +1665,81 @@ func TestErofsDifferCompareRejectsNonEROFSMounts(t *testing.T) {
 	}
 	t.Logf("correctly rejected non-EROFS mounts: %v", err)
 }
+
+func TestErofsBlockModeMountsAfterPrepare(t *testing.T) {
+	testutil.RequiresRoot(t)
+	ctx := namespaces.WithNamespace(t.Context(), "testsuite")
+
+	if _, err := exec.LookPath("mkfs.ext4"); err != nil {
+		t.Skipf("could not find mkfs.ext4: %v", err)
+	}
+
+	sn := newSnapshotter(t, WithDefaultSize(16*1024*1024))
+	snapshotter, cleanup, err := sn(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+
+	key := "block-active"
+	if _, err := snapshotter.Prepare(ctx, key, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	mounts1, err := snapshotter.Mounts(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mounts1) != 1 || mounts1[0].Type != "bind" {
+		t.Fatalf("expected first Mounts to return bind mount, got: %#v", mounts1)
+	}
+
+	mounts2, err := snapshotter.Mounts(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hasMkfs := false
+	for _, m := range mounts2 {
+		if m.Type == "mkfs/ext4" {
+			hasMkfs = true
+			break
+		}
+	}
+	if !hasMkfs {
+		t.Fatalf("expected second Mounts to include mkfs/ext4, got: %#v", mounts2)
+	}
+
+	if err := snapshotter.Remove(ctx, key); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestErofsCleanupRemovesOrphan(t *testing.T) {
+	testutil.RequiresRoot(t)
+	ctx := namespaces.WithNamespace(t.Context(), "testsuite")
+
+	sn := newSnapshotter(t)
+	snapshotter, cleanup, err := sn(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+
+	cleaner, ok := snapshotter.(snapshots.Cleaner)
+	if !ok {
+		t.Fatal("snapshotter does not implement Cleanup")
+	}
+
+	// Create an orphan snapshot directory not tracked by metadata.
+	orphanDir := filepath.Join(snapshotter.(*snapshotter).root, "snapshots", "orphan")
+	if err := os.MkdirAll(filepath.Join(orphanDir, "fs"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := cleaner.Cleanup(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(orphanDir); err == nil {
+		t.Fatalf("expected orphan dir to be removed: %s", orphanDir)
+	}
+}
