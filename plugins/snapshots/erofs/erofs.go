@@ -847,28 +847,39 @@ func (s *snapshotter) commitBlock(ctx context.Context, layerBlob string, id stri
 		}
 		return fmt.Errorf("failed to access writable layer %s: %w", layer, err)
 	}
-	m := mount.Mount{
-		Source:  layer,
-		Type:    "ext4",
-		Options: []string{"ro", "loop", "noload"},
-	}
+
 	rwRoot := filepath.Join(s.upperPath(id), "rw")
 	if err := os.MkdirAll(rwRoot, 0755); err != nil {
 		return fmt.Errorf("failed to create rw root: %w", err)
 	}
-	if err := m.Mount(rwRoot); err != nil {
-		return fmt.Errorf("failed to mount writable layer %s: %w", layer, err)
+
+	// Check if already mounted (from Prepare) before trying to mount again.
+	// If already mounted, we can use the existing mount.
+	alreadyMounted, err := mountinfo.Mounted(rwRoot)
+	if err != nil {
+		return fmt.Errorf("failed to check mount status: %w", err)
 	}
-	log.G(ctx).WithField("target", rwRoot).Debug("Mounted writable layer for conversion")
+	if !alreadyMounted {
+		m := mount.Mount{
+			Source:  layer,
+			Type:    "ext4",
+			Options: []string{"ro", "loop", "noload"},
+		}
+		if err := m.Mount(rwRoot); err != nil {
+			return fmt.Errorf("failed to mount writable layer %s: %w", layer, err)
+		}
+		log.G(ctx).WithField("target", rwRoot).Debug("Mounted writable layer for conversion")
+	}
+
+	// Always cleanup active mounts after conversion
+	defer func() {
+		cleanupActiveMounts(s.upperPath(id))
+	}()
+
 	upperDir := s.upperDir(id)
 	if _, err := os.Stat(upperDir); os.IsNotExist(err) {
-		mount.Unmount(rwRoot, 0)
 		// upper is empty, just convert the empty directory
 		upperDir = s.upperPath(id)
-	} else {
-		defer func() {
-			cleanupActiveMounts(s.upperPath(id))
-		}()
 	}
 	if cerr := convertDirToErofs(ctx, layerBlob, upperDir); cerr != nil {
 		return fmt.Errorf("failed to convert upper block to erofs layer: %w", cerr)

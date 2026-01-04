@@ -1721,19 +1721,19 @@ func TestErofsCleanupRemovesOrphan(t *testing.T) {
 	ctx := namespaces.WithNamespace(t.Context(), "testsuite")
 
 	sn := newSnapshotter(t)
-	snapshotter, cleanup, err := sn(ctx, t.TempDir())
+	snapshtr, cleanup, err := sn(ctx, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer cleanup()
 
-	cleaner, ok := snapshotter.(snapshots.Cleaner)
+	cleaner, ok := snapshtr.(snapshots.Cleaner)
 	if !ok {
 		t.Fatal("snapshotter does not implement Cleanup")
 	}
 
 	// Create an orphan snapshot directory not tracked by metadata.
-	orphanDir := filepath.Join(snapshotter.(*snapshotter).root, "snapshots", "orphan")
+	orphanDir := filepath.Join(snapshtr.(*snapshotter).root, "snapshots", "orphan")
 	if err := os.MkdirAll(filepath.Join(orphanDir, "fs"), 0755); err != nil {
 		t.Fatal(err)
 	}
