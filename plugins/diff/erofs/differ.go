@@ -46,6 +46,11 @@ type differ interface {
 	diff.Comparer
 }
 
+// MountManagerResolver is a function that resolves the mount manager lazily.
+// This allows the differ to look up the mount manager when it's actually needed,
+// avoiding plugin initialization order issues.
+type MountManagerResolver func() mount.Manager
+
 // erofsDiff does erofs comparison and application
 type erofsDiff struct {
 	store         content.Store
@@ -53,6 +58,7 @@ type erofsDiff struct {
 	// enableTarIndex enables generating tar index for tar content
 	// instead of fully converting the tar to EROFS format
 	enableTarIndex bool
+	mmResolver     MountManagerResolver
 }
 
 // DifferOpt is an option for configuring the erofs differ
@@ -69,6 +75,23 @@ func WithMkfsOptions(opts []string) DifferOpt {
 func WithTarIndexMode() DifferOpt {
 	return func(d *erofsDiff) {
 		d.enableTarIndex = true
+	}
+}
+
+// WithMountManager sets the mount manager used to resolve formatted mounts.
+// Deprecated: Use WithMountManagerResolver for lazy resolution.
+func WithMountManager(mm mount.Manager) DifferOpt {
+	return func(d *erofsDiff) {
+		d.mmResolver = func() mount.Manager { return mm }
+	}
+}
+
+// WithMountManagerResolver sets a resolver function for the mount manager.
+// The resolver is called lazily when the mount manager is actually needed,
+// allowing the differ to initialize before the mount manager is available.
+func WithMountManagerResolver(resolver MountManagerResolver) DifferOpt {
+	return func(d *erofsDiff) {
+		d.mmResolver = resolver
 	}
 }
 

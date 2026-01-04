@@ -18,12 +18,9 @@ package walking
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
-	"time"
 
 	"github.com/containerd/errdefs"
 	"github.com/containerd/log"
@@ -41,9 +38,20 @@ import (
 
 type walkingDiff struct {
 	store content.Store
+	mm    mount.Manager
 }
 
 var emptyDesc = ocispec.Descriptor{}
+
+// Option configures the walking differ.
+type Option func(*walkingDiff)
+
+// WithMountManager sets the mount manager used to resolve formatted mounts.
+func WithMountManager(mm mount.Manager) Option {
+	return func(d *walkingDiff) {
+		d.mm = mm
+	}
+}
 
 // NewWalkingDiff is a generic implementation of diff.Comparer.  The diff is
 // calculated by mounting both the upper and lower mount sets and walking the
@@ -51,10 +59,14 @@ var emptyDesc = ocispec.Descriptor{}
 // against each other or by comparing file existence between directories.
 // NewWalkingDiff uses no special characteristics of the mount sets and is
 // expected to work with any filesystem.
-func NewWalkingDiff(store content.Store) diff.Comparer {
-	return &walkingDiff{
+func NewWalkingDiff(store content.Store, opts ...Option) diff.Comparer {
+	d := &walkingDiff{
 		store: store,
 	}
+	for _, opt := range opts {
+		opt(d)
+	}
+	return d
 }
 
 // Compare creates a diff between the given mounts and uploads the result
@@ -98,12 +110,12 @@ func (s *walkingDiff) Compare(ctx context.Context, lower, upper []mount.Mount, o
 	}
 
 	var ocidesc ocispec.Descriptor
-	if err := mount.WithTempMount(ctx, lower, func(lowerRoot string) error {
-		return mount.WithReadonlyTempMount(ctx, upper, func(upperRoot string) error {
+	if err := s.withLowerMount(ctx, lower, func(lowerRoot string) error {
+		return s.withUpperMount(ctx, upper, func(upperRoot string) error {
 			var newReference bool
 			if config.Reference == "" {
 				newReference = true
-				config.Reference = uniqueRef()
+				config.Reference = mount.UniqueRef()
 			}
 
 			cw, err := s.store.Writer(ctx,
@@ -206,10 +218,50 @@ func (s *walkingDiff) Compare(ctx context.Context, lower, upper []mount.Mount, o
 	return ocidesc, nil
 }
 
-func uniqueRef() string {
-	t := time.Now()
-	var b [3]byte
-	// Ignore read failures, just decreases uniqueness
-	rand.Read(b[:])
-	return fmt.Sprintf("%d-%s", t.UnixNano(), base64.URLEncoding.EncodeToString(b[:]))
+func (s *walkingDiff) withLowerMount(ctx context.Context, mounts []mount.Mount, f func(root string) error) error {
+	return s.withResolvedMount(ctx, "walking-diff-lower", mounts, false, f)
+}
+
+func (s *walkingDiff) withUpperMount(ctx context.Context, mounts []mount.Mount, f func(root string) error) error {
+	return s.withResolvedMount(ctx, "walking-diff-upper", mounts, true, f)
+}
+
+func (s *walkingDiff) withResolvedMount(ctx context.Context, prefix string, mounts []mount.Mount, readonly bool, f func(root string) error) error {
+	if mount.NeedsMountManager(mounts) {
+		if s.mm == nil {
+			return fmt.Errorf("mount manager is required to resolve formatted mounts: %w", errdefs.ErrNotImplemented)
+		}
+		name := prefix + "-" + mount.UniqueRef()
+		temporary := !mount.NeedsNonTemporaryActivation(mounts)
+		var info mount.ActivationInfo
+		var err error
+		if temporary {
+			info, err = s.mm.Activate(ctx, name, mounts, mount.WithTemporary)
+		} else {
+			info, err = s.mm.Activate(ctx, name, mounts)
+		}
+		if err != nil {
+			return err
+		}
+		defer func() {
+			// Use a detached context for cleanup to ensure deactivation succeeds
+			// even if the parent context is cancelled.
+			cleanupCtx := context.WithoutCancel(ctx)
+			if derr := s.mm.Deactivate(cleanupCtx, name); derr != nil {
+				log.G(ctx).WithError(derr).Warnf("failed to deactivate mount %s", name)
+			}
+		}()
+		// Shortcut: if the result is a single bind mount, use the source directly
+		if len(info.System) == 1 && mount.TypeSuffix(info.System[0].Type) == "bind" && info.System[0].Source != "" {
+			return f(info.System[0].Source)
+		}
+		if readonly {
+			return mount.WithReadonlyTempMount(ctx, info.System, f)
+		}
+		return mount.WithTempMount(ctx, info.System, f)
+	}
+	if readonly {
+		return mount.WithReadonlyTempMount(ctx, mounts, f)
+	}
+	return mount.WithTempMount(ctx, mounts, f)
 }

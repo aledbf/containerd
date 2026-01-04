@@ -19,11 +19,13 @@ package plugin
 import (
 	"fmt"
 
+	"github.com/containerd/log"
 	"github.com/containerd/platforms"
 	"github.com/containerd/plugin"
 	"github.com/containerd/plugin/registry"
 
 	"github.com/containerd/containerd/v2/core/metadata"
+	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/internal/erofsutils"
 	"github.com/containerd/containerd/v2/plugins"
 	"github.com/containerd/containerd/v2/plugins/diff/erofs"
@@ -76,6 +78,24 @@ func init() {
 			if config.EnableTarIndex {
 				opts = append(opts, erofs.WithTarIndexMode())
 			}
+
+			// Use lazy resolver for mount manager to handle plugin initialization order.
+			// The mount manager may not be available when this plugin initializes,
+			// but will be available when Compare is called.
+			pluginSet := ic.Plugins()
+			opts = append(opts, erofs.WithMountManagerResolver(func() mount.Manager {
+				p := pluginSet.Get(plugins.MountManagerPlugin, "bolt")
+				if p == nil {
+					log.L.Debug("mount manager plugin not registered")
+					return nil
+				}
+				instance, err := p.Instance()
+				if err != nil {
+					log.L.WithError(err).Warn("failed to get mount manager instance")
+					return nil
+				}
+				return instance.(mount.Manager)
+			}))
 
 			return erofs.NewErofsDiffer(cs, opts...), nil
 		},

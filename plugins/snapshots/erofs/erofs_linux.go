@@ -88,8 +88,33 @@ func setImmutable(path string, enable bool) error {
 }
 
 func cleanupUpper(upper string) error {
-	if err := mount.UnmountAll(upper, 0); err != nil {
-		return fmt.Errorf("failed to unmount EROFS mount on %v: %w", upper, err)
+	return unmountAll(upper)
+}
+
+func cleanupActiveMounts(upper string) error {
+	merged := filepath.Join(upper, "merged")
+	lower := filepath.Join(upper, "lower")
+	rw := filepath.Join(upper, "rw")
+
+	_ = unmountAll(merged)
+
+	if entries, err := os.ReadDir(lower); err == nil {
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			_ = unmountAll(filepath.Join(lower, e.Name()))
+		}
+	}
+	_ = unmountAll(rw)
+	return nil
+}
+
+func unmountAll(target string) error {
+	if err := mount.UnmountAll(target, 0); err != nil {
+		if derr := mount.UnmountAll(target, unix.MNT_DETACH); derr != nil {
+			return err
+		}
 	}
 	return nil
 }

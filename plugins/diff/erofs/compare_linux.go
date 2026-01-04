@@ -18,12 +18,10 @@ package erofs
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/base64"
 	"fmt"
 	"io"
 	"path/filepath"
-	"time"
+	"strings"
 
 	"github.com/containerd/continuity/fs"
 	"github.com/containerd/errdefs"
@@ -41,10 +39,13 @@ import (
 	"github.com/containerd/containerd/v2/pkg/labels"
 )
 
-func writeDiff(ctx context.Context, w io.Writer, lower []mount.Mount, upperRoot string) error {
+// diffWriteFunc is a function that writes diff content to the provided writer.
+type diffWriteFunc func(ctx context.Context, w io.Writer) error
+
+func writeDiff(ctx context.Context, w io.Writer, lower []mount.Mount, upperRoot string, mm mount.Manager) error {
 	var opts []archive.ChangeWriterOpt
 
-	return mount.WithTempMount(ctx, lower, func(lowerRoot string) error {
+	return withLowerMount(ctx, lower, mm, func(lowerRoot string) error {
 		cw := archive.NewChangeWriter(w, upperRoot, opts...)
 		err := fs.DiffDirChanges(ctx, lowerRoot, upperRoot, fs.DiffSourceOverlayFS, cw.HandleChange)
 		if err != nil {
@@ -54,14 +55,29 @@ func writeDiff(ctx context.Context, w io.Writer, lower []mount.Mount, upperRoot 
 	})
 }
 
+func writeDiffFromMounts(ctx context.Context, w io.Writer, lower, upper []mount.Mount, mm mount.Manager) error {
+	return withLowerMount(ctx, lower, mm, func(lowerRoot string) error {
+		return withUpperMount(ctx, upper, mm, func(upperRoot string) error {
+			if err := archive.WriteDiff(ctx, w, lowerRoot, upperRoot); err != nil {
+				return fmt.Errorf("failed to write diff: %w", err)
+			}
+			return nil
+		})
+	})
+}
+
+// mountManager resolves and returns the mount manager.
+// Returns nil if no resolver is configured.
+func (s erofsDiff) mountManager() mount.Manager {
+	if s.mmResolver == nil {
+		return nil
+	}
+	return s.mmResolver()
+}
+
 // Compare creates a diff between the given mounts and uploads the result
 // to the content store.
 func (s erofsDiff) Compare(ctx context.Context, lower, upper []mount.Mount, opts ...diff.Opt) (d ocispec.Descriptor, err error) {
-	layer, err := erofsutils.MountsToLayer(upper)
-	if err != nil {
-		return emptyDesc, fmt.Errorf("unsupported layer for erofsDiff Compare method: %w", err)
-	}
-
 	var config diff.Config
 	for _, opt := range opts {
 		if err := opt(&config); err != nil {
@@ -76,6 +92,33 @@ func (s erofsDiff) Compare(ctx context.Context, lower, upper []mount.Mount, opts
 		config.MediaType = ocispec.MediaTypeImageLayerGzip
 	}
 
+	// Resolve mount manager lazily - this allows initialization before
+	// the mount manager plugin is available
+	mm := s.mountManager()
+
+	// Use mount manager path for mounts that need resolution (templates,
+	// formatted mounts, mkfs, etc). Otherwise use optimized overlay diff.
+	if requiresMountResolution(lower, upper) {
+		return s.writeAndCommitDiff(ctx, config, func(ctx context.Context, w io.Writer) error {
+			return writeDiffFromMounts(ctx, w, lower, upper, mm)
+		})
+	}
+
+	// For direct overlay diff, resolve the layer path from mounts.
+	layer, err := erofsutils.MountsToLayer(upper)
+	if err != nil {
+		return emptyDesc, fmt.Errorf("unsupported layer for erofsDiff Compare method: %w", err)
+	}
+
+	upperRoot := filepath.Join(layer, "fs")
+	return s.writeAndCommitDiff(ctx, config, func(ctx context.Context, w io.Writer) error {
+		return writeDiff(ctx, w, lower, upperRoot, mm)
+	})
+}
+
+// writeAndCommitDiff handles the common logic for writing a diff to the content store.
+// It manages compression, content writer lifecycle, and label updates.
+func (s erofsDiff) writeAndCommitDiff(ctx context.Context, config diff.Config, writeFn diffWriteFunc) (ocispec.Descriptor, error) {
 	var compressionType compression.Compression
 	switch config.MediaType {
 	case ocispec.MediaTypeImageLayer:
@@ -91,13 +134,13 @@ func (s erofsDiff) Compare(ctx context.Context, lower, upper []mount.Mount, opts
 	var newReference bool
 	if config.Reference == "" {
 		newReference = true
-		config.Reference = uniqueRef()
+		config.Reference = mount.UniqueRef()
 	}
 
 	cw, err := s.store.Writer(ctx,
 		content.WithRef(config.Reference),
 		content.WithDescriptor(ocispec.Descriptor{
-			MediaType: config.MediaType, // most contentstore implementations just ignore this
+			MediaType: config.MediaType,
 		}))
 	if err != nil {
 		return emptyDesc, fmt.Errorf("failed to open writer: %w", err)
@@ -122,7 +165,6 @@ func (s erofsDiff) Compare(ctx context.Context, lower, upper []mount.Mount, opts
 		}
 	}
 
-	upperRoot := filepath.Join(layer, "fs")
 	if compressionType != compression.Uncompressed {
 		dgstr := digest.SHA256.Digester()
 		var compressed io.WriteCloser
@@ -137,7 +179,7 @@ func (s erofsDiff) Compare(ctx context.Context, lower, upper []mount.Mount, opts
 				return emptyDesc, fmt.Errorf("failed to get compressed stream: %w", errOpen)
 			}
 		}
-		errOpen = writeDiff(ctx, io.MultiWriter(compressed, dgstr.Hash()), lower, upperRoot)
+		errOpen = writeFn(ctx, io.MultiWriter(compressed, dgstr.Hash()))
 		compressed.Close()
 		if errOpen != nil {
 			return emptyDesc, fmt.Errorf("failed to write compressed diff: %w", errOpen)
@@ -148,9 +190,8 @@ func (s erofsDiff) Compare(ctx context.Context, lower, upper []mount.Mount, opts
 		}
 		config.Labels[labels.LabelUncompressed] = dgstr.Digest().String()
 	} else {
-		err := writeDiff(ctx, cw, lower, upperRoot)
-		if err != nil {
-			return emptyDesc, fmt.Errorf("failed to create diff tar stream: %w", err)
+		if errOpen = writeFn(ctx, cw); errOpen != nil {
+			return emptyDesc, fmt.Errorf("failed to write diff: %w", errOpen)
 		}
 	}
 
@@ -189,10 +230,149 @@ func (s erofsDiff) Compare(ctx context.Context, lower, upper []mount.Mount, opts
 	}, nil
 }
 
-func uniqueRef() string {
-	t := time.Now()
-	var b [3]byte
-	// Ignore read failures, just decreases uniqueness
-	rand.Read(b[:])
-	return fmt.Sprintf("%d-%s", t.UnixNano(), base64.URLEncoding.EncodeToString(b[:]))
+// withLowerMount resolves lower mounts and calls f with the resulting root path.
+// If mounts require the mount manager (formatted mounts, templates, or EROFS),
+// it activates them through the mount manager first.
+func withLowerMount(ctx context.Context, lower []mount.Mount, mm mount.Manager, f func(root string) error) error {
+	if mount.NeedsMountManager(lower) {
+		if mm == nil {
+			return fmt.Errorf("mount manager is required to resolve formatted mounts: %w", errdefs.ErrNotImplemented)
+		}
+		name := "erofs-diff-lower-" + mount.UniqueRef()
+		temporary := !mount.NeedsNonTemporaryActivation(lower)
+		var info mount.ActivationInfo
+		var err error
+		if temporary {
+			info, err = mm.Activate(ctx, name, lower, mount.WithTemporary)
+		} else {
+			info, err = mm.Activate(ctx, name, lower)
+		}
+		if err != nil {
+			return err
+		}
+		defer func() {
+			// Use a detached context for cleanup to ensure deactivation succeeds
+			// even if the parent context is cancelled.
+			cleanupCtx := context.WithoutCancel(ctx)
+			if derr := mm.Deactivate(cleanupCtx, name); derr != nil {
+				log.G(ctx).WithError(derr).Warnf("failed to deactivate lower mount %s", name)
+			}
+		}()
+		// Shortcut: if the result is a single bind mount, use the source directly
+		if len(info.System) == 1 && mount.TypeSuffix(info.System[0].Type) == "bind" && info.System[0].Source != "" {
+			return f(info.System[0].Source)
+		}
+		// Shortcut: if we have a merged EROFS and a lower-only overlay, use the EROFS mount point
+		if root, ok := mergedLowerFromActive(info.Active); ok && lowerOverlayOnly(info.System) {
+			return f(root)
+		}
+		return mount.WithTempMount(ctx, info.System, f)
+	}
+	return mount.WithTempMount(ctx, lower, f)
+}
+
+// withUpperMount resolves upper mounts and calls f with the resulting root path.
+// If mounts require the mount manager (formatted mounts, templates, or EROFS),
+// it activates them through the mount manager first.
+func withUpperMount(ctx context.Context, upper []mount.Mount, mm mount.Manager, f func(root string) error) error {
+	if mount.NeedsMountManager(upper) {
+		if mm == nil {
+			return fmt.Errorf("mount manager is required to resolve formatted mounts: %w", errdefs.ErrNotImplemented)
+		}
+		name := "erofs-diff-upper-" + mount.UniqueRef()
+		temporary := !mount.NeedsNonTemporaryActivation(upper)
+		var info mount.ActivationInfo
+		var err error
+		if temporary {
+			info, err = mm.Activate(ctx, name, upper, mount.WithTemporary)
+		} else {
+			info, err = mm.Activate(ctx, name, upper)
+		}
+		if err != nil {
+			return err
+		}
+		defer func() {
+			// Use a detached context for cleanup to ensure deactivation succeeds
+			// even if the parent context is cancelled.
+			cleanupCtx := context.WithoutCancel(ctx)
+			if derr := mm.Deactivate(cleanupCtx, name); derr != nil {
+				log.G(ctx).WithError(derr).Warnf("failed to deactivate upper mount %s", name)
+			}
+		}()
+		// Shortcut: if the result is a single bind mount, use the source directly
+		if len(info.System) == 1 && mount.TypeSuffix(info.System[0].Type) == "bind" && info.System[0].Source != "" {
+			return f(info.System[0].Source)
+		}
+		return mount.WithReadonlyTempMount(ctx, info.System, f)
+	}
+	return mount.WithReadonlyTempMount(ctx, upper, f)
+}
+
+// requiresMountResolution determines if the diff operation needs to go through
+// the mount manager path (walking diff) rather than the optimized overlay path.
+//
+// The optimized overlay diff can be used when:
+//   - Upper mounts are simple EROFS layers that can be accessed directly
+//   - No mounts require template resolution or filesystem creation
+//
+// The mount manager path is required when any of these conditions apply:
+//   - Upper has mkfs/* mounts (filesystem generated at mount time)
+//   - Lower or upper has templates (e.g., "{{ mount 0 }}")
+//   - Lower or upper has format/mkfs/mkdir mounts
+//   - Lower or upper has multi-device EROFS mounts
+func requiresMountResolution(lower, upper []mount.Mount) bool {
+	// mkfs/* mounts generate filesystem content at mount time,
+	// so we can't access the upper layer directly
+	for _, m := range upper {
+		if strings.HasPrefix(m.Type, "mkfs/") {
+			return true
+		}
+	}
+	// Any mount requiring the mount manager means we need to
+	// resolve through the walking diff path
+	return mount.NeedsMountManager(lower) || mount.NeedsMountManager(upper)
+}
+
+// lowerOverlayOnly returns true if the mounts represent an overlay with only
+// lower directories (no upperdir). This indicates a read-only overlay that
+// can be accessed directly through its lower mount point.
+func lowerOverlayOnly(mounts []mount.Mount) bool {
+	if len(mounts) != 1 {
+		return false
+	}
+	if mount.TypeSuffix(mounts[0].Type) != "overlay" {
+		return false
+	}
+	hasLower := false
+	for _, opt := range mounts[0].Options {
+		if strings.HasPrefix(opt, "upperdir=") {
+			return false
+		}
+		if strings.HasPrefix(opt, "lowerdir=") {
+			hasLower = true
+		}
+	}
+	return hasLower
+}
+
+// mergedLowerFromActive finds the mount point of a merged EROFS filesystem
+// from the list of active mounts. It searches backwards since the merged
+// fsmeta mount is typically the last EROFS mount in the activation chain.
+// Returns the mount point if an fsmeta.erofs source or a multi-device EROFS
+// mount (with device= option) is found.
+func mergedLowerFromActive(active []mount.ActiveMount) (string, bool) {
+	for i := len(active) - 1; i >= 0; i-- {
+		if mount.TypeSuffix(active[i].Type) != "erofs" {
+			continue
+		}
+		if strings.HasSuffix(active[i].Source, "fsmeta.erofs") {
+			return active[i].MountPoint, true
+		}
+		for _, opt := range active[i].Options {
+			if strings.HasPrefix(opt, "device=") {
+				return active[i].MountPoint, true
+			}
+		}
+	}
+	return "", false
 }
