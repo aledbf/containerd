@@ -1,3 +1,5 @@
+//go:build linux
+
 /*
    Copyright The containerd Authors.
 
@@ -1739,7 +1741,12 @@ func TestErofsCleanupRemovesOrphan(t *testing.T) {
 	if err := cleaner.Cleanup(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(orphanDir); err == nil {
+
+	_, err = os.Stat(orphanDir)
+	if err == nil {
 		t.Fatalf("expected orphan dir to be removed: %s", orphanDir)
+	}
+	if !os.IsNotExist(err) {
+		t.Fatalf("expected not exist error, got: %v", err)
 	}
 }
