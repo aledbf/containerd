@@ -109,9 +109,27 @@ type snapshotter struct {
 
 const (
 	// extractLabel is the label key used to mark snapshots for layer extraction.
-	// This is stored in the snapshot metadata for atomic reads within transactions.
+	// This is stored in the snapshot metadata for atomic reads within transactions,
+	// avoiding TOCTOU race conditions that would occur with filesystem markers.
 	extractLabel = "containerd.io/snapshot/erofs.extract"
-	// erofsLayerMarker indicates a directory is managed by the EROFS snapshotter.
+
+	// erofsLayerMarker is a filesystem marker file that indicates a directory
+	// is managed by the EROFS snapshotter.
+	//
+	// Purpose: The EROFS differ (plugins/diff/erofs) checks for this marker
+	// to validate that mounts are genuine EROFS snapshotter layers before
+	// processing them. Without this marker, the differ returns ErrNotImplemented,
+	// allowing fallback to other differs.
+	//
+	// Creation points: The marker is created via ensureMarkerFile() in multiple
+	// code paths because different operations may create the layer directory:
+	//   - createSnapshotDirectory: Initial snapshot creation (Prepare/View)
+	//   - prepareMounts: When returning mounts for an active snapshot
+	//   - diffMounts: When preparing mounts specifically for diff operations
+	//
+	// Using ensureMarkerFile() (idempotent) rather than direct WriteFile ensures
+	// the marker exists regardless of which code path runs first, without errors
+	// if it already exists.
 	erofsLayerMarker = ".erofslayer"
 )
 
@@ -270,8 +288,8 @@ func (s *snapshotter) prepareDirectory(ctx context.Context, snapshotDir string, 
 				return td, err
 			}
 		}
-		// Create a special file for the EROFS differ to indicate it will be
-		// prepared as an EROFS layer by the EROFS snapshotter.
+		// Create EROFS layer marker at snapshot root (e.g., /snapshots/{id}/.erofslayer).
+		// This is the primary marker location checked by the differ for bind/overlay mounts.
 		if err := os.WriteFile(filepath.Join(td, erofsLayerMarker), []byte{}, 0644); err != nil {
 			return td, err
 		}
@@ -506,7 +524,14 @@ func isExtractKey(key string) bool {
 	return strings.HasPrefix(path.Base(key), snapshots.UnpackKeyPrefix)
 }
 
-// ensureMarkerFile creates a marker file at the given path if it doesn't exist.
+// ensureMarkerFile creates the EROFS layer marker file at the given path if
+// it doesn't already exist. This is idempotent - calling it multiple times
+// with the same path is safe and will not return an error.
+//
+// The marker file is checked by erofsutils.MountsToLayer() in the EROFS differ
+// to validate that a directory is a genuine EROFS snapshotter layer. If the
+// marker is missing, the differ returns ErrNotImplemented to allow fallback
+// to other differs (e.g., the walking differ).
 func ensureMarkerFile(path string) error {
 	if _, err := os.Stat(path); err != nil {
 		if os.IsNotExist(err) {
@@ -556,7 +581,9 @@ func (s *snapshotter) activeMounts(snap storage.Snapshot) ([]mount.Mount, error)
 		}, nil
 	}
 
-	// Create marker files
+	// Create EROFS layer markers in active mount subdirectories.
+	// These markers at fs/ and fs/rw/ ensure the differ can validate layers
+	// when mounts reference these directories (e.g., overlay upperdir paths).
 	for _, markerRoot := range []string{upperRoot, rwRoot} {
 		if err := ensureMarkerFile(filepath.Join(markerRoot, erofsLayerMarker)); err != nil {
 			return nil, fmt.Errorf("failed to create erofs marker in %s: %w", markerRoot, err)
@@ -703,6 +730,10 @@ func (s *snapshotter) diffMounts(snap storage.Snapshot) ([]mount.Mount, error) {
 		return nil, fmt.Errorf("failed to create upper root: %w", err)
 	}
 
+	// Ensure EROFS layer marker exists at the snapshot root for diff operations.
+	// This may be redundant with createSnapshotDirectory, but ensureMarkerFile
+	// is idempotent and this guards against edge cases where diff mounts are
+	// requested without a prior Prepare call.
 	if err := ensureMarkerFile(filepath.Join(layerRoot, erofsLayerMarker)); err != nil {
 		return nil, fmt.Errorf("failed to create erofs marker: %w", err)
 	}
