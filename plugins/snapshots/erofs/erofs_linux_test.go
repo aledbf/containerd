@@ -1946,7 +1946,7 @@ func TestErofsBlockModeMountsAfterPrepare(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// First Mounts() call returns template mounts for VM runtime.
+	// Block mode returns template mounts when overlay is not mounted on host.
 	// VM-based runtimes (like qemubox) need block devices, not bind mounts.
 	mounts1, err := snapshtr.Mounts(ctx, key)
 	if err != nil {
@@ -1960,36 +1960,17 @@ func TestErofsBlockModeMountsAfterPrepare(t *testing.T) {
 		}
 	}
 	if !hasMkfs {
-		t.Fatalf("expected first Mounts to include mkfs/ext4 template, got: %#v", mounts1)
+		t.Fatalf("expected Mounts to include mkfs/ext4 template, got: %#v", mounts1)
 	}
 
-	// Subsequent Mounts() calls return bind mount (for differ to read upper layer).
-	// By this point the VM runtime has stopped, so no dual-mount issues.
+	// Subsequent calls also return template mounts (no overlay mounted on host).
 	mounts2, err := snapshtr.Mounts(ctx, key)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(mounts2) != 1 || mounts2[0].Type != "bind" {
-		t.Fatalf("expected second Mounts to return bind mount, got: %#v", mounts2)
+	if len(mounts1) != len(mounts2) {
+		t.Fatalf("expected consistent template mounts, got %d vs %d", len(mounts1), len(mounts2))
 	}
-
-	// Cleanup active mounts before removing
-	snap := snapshtr.(*snapshotter)
-	id, _, _, err := func() (string, snapshots.Info, snapshots.Usage, error) {
-		var id string
-		var info snapshots.Info
-		var usage snapshots.Usage
-		err := snap.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
-			var err error
-			id, info, usage, err = storage.GetInfo(ctx, key)
-			return err
-		})
-		return id, info, usage, err
-	}()
-	if err != nil {
-		t.Fatal(err)
-	}
-	_ = cleanupActiveMounts(snap.upperPath(id))
 
 	if err := snapshtr.Remove(ctx, key); err != nil {
 		t.Fatal(err)
