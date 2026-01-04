@@ -1688,19 +1688,29 @@ func TestErofsBlockModeMountsAfterPrepare(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Block mode always returns template mounts (mkfs/ext4) for active snapshots.
+	// The caller should use mount manager to resolve these templates.
 	mounts1, err := snapshotter.Mounts(ctx, key)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(mounts1) != 1 || mounts1[0].Type != "bind" {
-		t.Fatalf("expected first Mounts to return bind mount, got: %#v", mounts1)
+	hasMkfs := false
+	for _, m := range mounts1 {
+		if m.Type == "mkfs/ext4" {
+			hasMkfs = true
+			break
+		}
+	}
+	if !hasMkfs {
+		t.Fatalf("expected Mounts to include mkfs/ext4, got: %#v", mounts1)
 	}
 
+	// Subsequent calls should also return template mounts
 	mounts2, err := snapshotter.Mounts(ctx, key)
 	if err != nil {
 		t.Fatal(err)
 	}
-	hasMkfs := false
+	hasMkfs = false
 	for _, m := range mounts2 {
 		if m.Type == "mkfs/ext4" {
 			hasMkfs = true
