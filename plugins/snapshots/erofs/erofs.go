@@ -824,12 +824,6 @@ func (s *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 		}
 	}
 
-	// For block mode active snapshots (except extract), return template mounts.
-	// The actual mounting happens on the first Mounts() call via activeMounts().
-	// This allows callers to use mount manager to resolve templates.
-	if kind == snapshots.KindActive && s.blockMode && !isExtractKey(key) {
-		return s.templateMounts(snap)
-	}
 	return s.mounts(snap, info)
 }
 
@@ -1013,16 +1007,20 @@ func (s *snapshotter) Mounts(ctx context.Context, key string) (_ []mount.Mount, 
 	}
 	var mounts []mount.Mount
 	if s.blockMode && snap.Kind == snapshots.KindActive && !s.isExtractSnapshot(snap.ID) {
-		// Always return template mounts for block mode active snapshots.
-		// The caller (container runtime or differ) should use mount manager to
-		// resolve these templates. This ensures proper handling for both:
-		// - Container runtime: uses mount manager to set up mounts
-		// - Differ/commit: uses mount manager path which handles overlay correctly
-		//
-		// Note: We consume the prepared marker here to track first access,
-		// but always return template mounts regardless.
-		s.consumePreparedMarker(snap.ID)
-		mounts, err = s.runtimeMounts(snap, info)
+		// Check if this is the first Mounts() call after Prepare() by consuming the marker.
+		// This determines whether to use activeMounts (first call) or runtimeMounts (subsequent).
+		if s.consumePreparedMarker(snap.ID) {
+			mounts, err = s.activeMounts(snap)
+		} else {
+			// Cleanup host's active mounts before returning template mounts.
+			// This is critical because:
+			// 1. activeMounts() during Prepare/first-Mounts sets up ext4 on loop device
+			// 2. Template mounts will be processed by mount manager or VM, creating new mounts
+			// 3. Having two ext4 mounts on the same filesystem causes cache coherency issues
+			// 4. The diff/commit operations need to see fresh data from VM's writes
+			_ = cleanupActiveMounts(s.upperPath(snap.ID))
+			mounts, err = s.runtimeMounts(snap, info)
+		}
 	} else {
 		mounts, err = s.mounts(snap, info)
 	}

@@ -132,6 +132,7 @@ func TestErofsFsverity(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
+	defer cleanupAllSnapshots(ctx, s)
 
 	// Create a test snapshot
 	key := "test-snapshot"
@@ -218,6 +219,7 @@ func TestErofsDifferWithTarIndexMode(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
+	defer cleanupAllSnapshots(ctx, s)
 	snap := s.(*snapshotter)
 
 	// Create test tar content
@@ -366,6 +368,7 @@ func TestErofsDifferCompareWithMountManager(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
+	defer cleanupAllSnapshots(ctx, s)
 
 	snap := s.(*snapshotter)
 
@@ -447,6 +450,206 @@ func TestErofsDifferCompareWithMountManager(t *testing.T) {
 	}
 }
 
+func TestErofsSnapshotCommitApplyFlow(t *testing.T) {
+	testutil.RequiresRoot(t)
+	ctx := namespaces.WithNamespace(t.Context(), "testsuite")
+
+	_, err := exec.LookPath("mkfs.erofs")
+	if err != nil {
+		t.Skipf("could not find mkfs.erofs: %v", err)
+	}
+	if !findErofs() {
+		t.Skip("check for erofs kernel support failed, skipping test")
+	}
+
+	tempDir := t.TempDir()
+	contentStore := imagetest.NewContentStore(ctx, t).Store
+
+	snapshotRoot := filepath.Join(tempDir, "snapshots")
+	s, err := NewSnapshotter(snapshotRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	defer cleanupAllSnapshots(ctx, s)
+
+	snap := s.(*snapshotter)
+
+	db, err := bolt.Open(filepath.Join(tempDir, "mounts.db"), 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	mountRoot := filepath.Join(tempDir, "mounts")
+	mm, err := manager.NewManager(db, mountRoot, manager.WithAllowedRoot(snapshotRoot))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if closer, ok := mm.(interface{ Close() error }); ok {
+		defer closer.Close()
+	}
+
+	differ := erofsdiffer.NewErofsDiffer(contentStore, erofsdiffer.WithMountManager(mm))
+
+	writeFiles := func(dir string, files map[string]string) error {
+		for name, content := range files {
+			if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0644); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	commitWithFiles := func(key, parent string, files map[string]string) (string, error) {
+		if _, err := s.Prepare(ctx, key, parent); err != nil {
+			return "", err
+		}
+		id := snapshotID(t, snap, key)
+		if err := writeFiles(snap.upperPath(id), files); err != nil {
+			return "", err
+		}
+		commitKey := key + "-commit"
+		if err := s.Commit(ctx, commitKey, key); err != nil {
+			return "", err
+		}
+		return commitKey, nil
+	}
+
+	runFlow := func(name string, baseFiles, midFiles, topFiles, upperFiles map[string]string, expectMulti bool) {
+		baseCommit, err := commitWithFiles(name+"-base", "", baseFiles)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		parentCommit := baseCommit
+		if midFiles != nil {
+			midCommit, err := commitWithFiles(name+"-mid", parentCommit, midFiles)
+			if err != nil {
+				t.Fatal(err)
+			}
+			parentCommit = midCommit
+		}
+		if topFiles != nil {
+			topCommit, err := commitWithFiles(name+"-top", parentCommit, topFiles)
+			if err != nil {
+				t.Fatal(err)
+			}
+			parentCommit = topCommit
+		}
+
+		lowerKey := name + "-lower"
+		lowerMounts, err := s.View(ctx, lowerKey, parentCommit)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		upperKey := name + "-upper"
+		upperMounts, err := s.Prepare(ctx, upperKey, parentCommit)
+		if err != nil {
+			t.Fatal(err)
+		}
+		upperID := snapshotID(t, snap, upperKey)
+		if err := writeFiles(snap.upperPath(upperID), upperFiles); err != nil {
+			t.Fatal(err)
+		}
+
+		if expectMulti {
+			if !mountsHaveTemplate(lowerMounts) {
+				t.Fatalf("expected lower mounts to include overlay templates, got: %#v", lowerMounts)
+			}
+		} else {
+			if len(lowerMounts) != 1 || mountTypeSuffixTest(lowerMounts[0].Type) != "erofs" {
+				t.Fatalf("expected single EROFS mount, got: %#v", lowerMounts)
+			}
+		}
+		if !mountsHaveTemplate(upperMounts) {
+			t.Fatalf("expected upper mounts to include overlay templates, got: %#v", upperMounts)
+		}
+
+		desc, err := differ.Compare(ctx, lowerMounts, upperMounts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if desc.Digest == "" || desc.Size == 0 {
+			t.Fatalf("unexpected diff descriptor: %+v", desc)
+		}
+
+		applyKey := name + "-apply"
+		applyMounts, err := s.Prepare(ctx, applyKey, parentCommit)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := differ.Apply(ctx, desc, applyMounts); err != nil {
+			t.Fatal(err)
+		}
+		applyCommit := name + "-apply-commit"
+		if err := s.Commit(ctx, applyCommit, applyKey); err != nil {
+			t.Fatal(err)
+		}
+
+		viewKey := name + "-view"
+		viewMounts, err := s.View(ctx, viewKey, applyCommit)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Use mount manager to process template mounts (overlay templates need to be resolved)
+		viewActivation, err := mm.Activate(ctx, viewKey+"-activation", cloneMounts(viewMounts))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer mm.Deactivate(ctx, viewActivation.Name)
+
+		verifyFiles := func(root string, files map[string]string) {
+			for name, content := range files {
+				data, err := os.ReadFile(filepath.Join(root, name))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if string(data) != content {
+					t.Fatalf("expected %s content %q, got %q", name, content, string(data))
+				}
+			}
+		}
+
+		// Mount and verify files
+		if err := mount.WithTempMount(ctx, viewActivation.System, func(root string) error {
+			verifyFiles(root, baseFiles)
+			if midFiles != nil {
+				verifyFiles(root, midFiles)
+			}
+			if topFiles != nil {
+				verifyFiles(root, topFiles)
+			}
+			verifyFiles(root, upperFiles)
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	t.Run("single-layer", func(t *testing.T) {
+		runFlow("single",
+			map[string]string{"base.txt": "base"},
+			nil,
+			nil,
+			map[string]string{"upper.txt": "upper"},
+			false,
+		)
+	})
+
+	t.Run("multi-layer-overlay", func(t *testing.T) {
+		runFlow("multi",
+			map[string]string{"base.txt": "base"},
+			map[string]string{"mid.txt": "mid"},
+			map[string]string{"top.txt": "top"},
+			map[string]string{"upper.txt": "upper"},
+			true,
+		)
+	})
+}
+
 func TestErofsDifferCompareBlockUpperFallback(t *testing.T) {
 	testutil.RequiresRoot(t)
 	ctx := namespaces.WithNamespace(t.Context(), "testsuite")
@@ -468,6 +671,7 @@ func TestErofsDifferCompareBlockUpperFallback(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
+	defer cleanupAllSnapshots(ctx, s)
 
 	baseKey := "base"
 	if _, err := s.Prepare(ctx, baseKey, ""); err != nil {
@@ -478,7 +682,16 @@ func TestErofsDifferCompareBlockUpperFallback(t *testing.T) {
 	}
 
 	upperKey := "upper"
-	upperMounts, err := s.Prepare(ctx, upperKey, "base-commit")
+	// Prepare() sets up the snapshot and returns bind mount (first access via activeMounts).
+	if _, err := s.Prepare(ctx, upperKey, "base-commit"); err != nil {
+		t.Fatal(err)
+	}
+	// First Mounts() call consumes the prepared marker and returns bind mount.
+	if _, err := s.Mounts(ctx, upperKey); err != nil {
+		t.Fatal(err)
+	}
+	// Second Mounts() call returns template mounts for mount manager.
+	upperMounts, err := s.Mounts(ctx, upperKey)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -568,6 +781,7 @@ func TestErofsDifferComparePreservesWhiteouts(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
+	defer cleanupAllSnapshots(ctx, s)
 
 	snap := s.(*snapshotter)
 
@@ -576,7 +790,8 @@ func TestErofsDifferComparePreservesWhiteouts(t *testing.T) {
 		t.Fatal(err)
 	}
 	baseID := snapshotID(t, snap, baseKey)
-	if err := os.WriteFile(filepath.Join(snap.upperPath(baseID), "gone.txt"), []byte("gone"), 0644); err != nil {
+	// In block mode, activeMounts() sets up rw/upper structure, so write there
+	if err := os.WriteFile(filepath.Join(snap.upperDir(baseID), "gone.txt"), []byte("gone"), 0644); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Commit(ctx, "base-commit", baseKey); err != nil {
@@ -584,7 +799,16 @@ func TestErofsDifferComparePreservesWhiteouts(t *testing.T) {
 	}
 
 	upperKey := "upper"
-	upperMounts, err := s.Prepare(ctx, upperKey, "base-commit")
+	// Prepare() sets up the snapshot and returns bind mount (first access via activeMounts).
+	if _, err := s.Prepare(ctx, upperKey, "base-commit"); err != nil {
+		t.Fatal(err)
+	}
+	// First Mounts() call consumes the prepared marker and returns bind mount.
+	if _, err := s.Mounts(ctx, upperKey); err != nil {
+		t.Fatal(err)
+	}
+	// Second Mounts() call returns template mounts for mount manager.
+	upperMounts, err := s.Mounts(ctx, upperKey)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -660,6 +884,7 @@ func TestErofsDifferCompareWithFormattedUpperMounts(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
+	defer cleanupAllSnapshots(ctx, s)
 
 	baseKey := "base"
 	if _, err := s.Prepare(ctx, baseKey, ""); err != nil {
@@ -670,7 +895,16 @@ func TestErofsDifferCompareWithFormattedUpperMounts(t *testing.T) {
 	}
 
 	upperKey := "upper"
-	upperMounts, err := s.Prepare(ctx, upperKey, "base-commit")
+	// Prepare() sets up the snapshot and returns bind mount (first access via activeMounts).
+	if _, err := s.Prepare(ctx, upperKey, "base-commit"); err != nil {
+		t.Fatal(err)
+	}
+	// First Mounts() call consumes the prepared marker and returns bind mount.
+	if _, err := s.Mounts(ctx, upperKey); err != nil {
+		t.Fatal(err)
+	}
+	// Second Mounts() call returns template mounts for mount manager.
+	upperMounts, err := s.Mounts(ctx, upperKey)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -766,6 +1000,7 @@ func TestErofsDifferCompareWithoutMountManager(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
+	defer cleanupAllSnapshots(ctx, s)
 
 	snap := s.(*snapshotter)
 
@@ -912,6 +1147,37 @@ func snapshotID(t *testing.T, s *snapshotter, key string) string {
 	return id
 }
 
+// cleanupAllSnapshots removes all snapshots and cleans up their active mounts.
+// This ensures that t.TempDir() cleanup doesn't fail with "device or resource busy".
+func cleanupAllSnapshots(ctx context.Context, s snapshots.Snapshotter) {
+	snap := s.(*snapshotter)
+	var keys []string
+	_ = s.Walk(ctx, func(ctx context.Context, info snapshots.Info) error {
+		keys = append(keys, info.Name)
+		return nil
+	})
+	// Remove in reverse order (children first, then parents)
+	for i := len(keys) - 1; i >= 0; i-- {
+		// First cleanup active mounts if in block mode
+		if snap.blockMode {
+			if id, _, _, err := func() (string, snapshots.Info, snapshots.Usage, error) {
+				var id string
+				var info snapshots.Info
+				var usage snapshots.Usage
+				err := snap.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
+					var err error
+					id, info, usage, err = storage.GetInfo(ctx, keys[i])
+					return err
+				})
+				return id, info, usage, err
+			}(); err == nil {
+				_ = cleanupActiveMounts(snap.upperPath(id))
+			}
+		}
+		_ = s.Remove(ctx, keys[i])
+	}
+}
+
 // TestErofsDifferCompareMultipleStackedLayers tests Compare with 5+ stacked
 // EROFS layers to verify that overlay template expansion works correctly
 // with many layers.
@@ -936,6 +1202,7 @@ func TestErofsDifferCompareMultipleStackedLayers(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
+	defer cleanupAllSnapshots(ctx, s)
 
 	snap := s.(*snapshotter)
 
@@ -1688,29 +1955,21 @@ func TestErofsBlockModeMountsAfterPrepare(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Block mode always returns template mounts (mkfs/ext4) for active snapshots.
-	// The caller should use mount manager to resolve these templates.
+	// First Mounts() call returns bind mount (from activeMounts which sets up the overlay).
 	mounts1, err := snapshotter.Mounts(ctx, key)
 	if err != nil {
 		t.Fatal(err)
 	}
-	hasMkfs := false
-	for _, m := range mounts1 {
-		if m.Type == "mkfs/ext4" {
-			hasMkfs = true
-			break
-		}
-	}
-	if !hasMkfs {
-		t.Fatalf("expected Mounts to include mkfs/ext4, got: %#v", mounts1)
+	if len(mounts1) != 1 || mounts1[0].Type != "bind" {
+		t.Fatalf("expected first Mounts to return bind mount, got: %#v", mounts1)
 	}
 
-	// Subsequent calls should also return template mounts
+	// Subsequent calls return template mounts for mount manager to resolve.
 	mounts2, err := snapshotter.Mounts(ctx, key)
 	if err != nil {
 		t.Fatal(err)
 	}
-	hasMkfs = false
+	hasMkfs := false
 	for _, m := range mounts2 {
 		if m.Type == "mkfs/ext4" {
 			hasMkfs = true
