@@ -1,0 +1,279 @@
+/*
+   Copyright The containerd Authors.
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+*/
+
+package mount
+
+import (
+	"strings"
+	"testing"
+)
+
+func TestNeedsMountManager(t *testing.T) {
+	tests := []struct {
+		name     string
+		mounts   []Mount
+		expected bool
+	}{
+		{
+			name:     "empty mounts",
+			mounts:   []Mount{},
+			expected: false,
+		},
+		{
+			name: "simple bind mount",
+			mounts: []Mount{
+				{Type: "bind", Source: "/src", Target: "/dst"},
+			},
+			expected: false,
+		},
+		{
+			name: "overlay mount",
+			mounts: []Mount{
+				{Type: "overlay", Source: "overlay", Options: []string{"lowerdir=/lower", "upperdir=/upper"}},
+			},
+			expected: false,
+		},
+		{
+			name: "template in source",
+			mounts: []Mount{
+				{Type: "bind", Source: "{{ mount 0 }}", Target: "/dst"},
+			},
+			expected: true,
+		},
+		{
+			name: "template in options",
+			mounts: []Mount{
+				{Type: "overlay", Source: "overlay", Options: []string{"lowerdir={{ mount 0 }}"}},
+			},
+			expected: true,
+		},
+		{
+			name: "format mount type",
+			mounts: []Mount{
+				{Type: "format/ext4", Source: "/dev/loop0"},
+			},
+			expected: true,
+		},
+		{
+			name: "mkfs mount type",
+			mounts: []Mount{
+				{Type: "mkfs/ext4", Source: "/dev/loop0"},
+			},
+			expected: true,
+		},
+		{
+			name: "mkdir mount type",
+			mounts: []Mount{
+				{Type: "mkdir/bind", Source: "/src"},
+			},
+			expected: true,
+		},
+		{
+			name: "simple erofs mount - no device options",
+			mounts: []Mount{
+				{Type: "erofs", Source: "/path/to/layer.erofs", Options: []string{"ro", "loop"}},
+			},
+			expected: false,
+		},
+		{
+			name: "multi-device erofs mount - has device options",
+			mounts: []Mount{
+				{Type: "erofs", Source: "/path/to/layer.erofs", Options: []string{"ro", "loop", "device=/path/to/blob1", "device=/path/to/blob2"}},
+			},
+			expected: true,
+		},
+		{
+			name: "format with nested type",
+			mounts: []Mount{
+				{Type: "format/mkdir/overlay", Source: "/dev/loop0"},
+			},
+			expected: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := NeedsMountManager(tc.mounts)
+			if got != tc.expected {
+				t.Errorf("NeedsMountManager() = %v, want %v", got, tc.expected)
+			}
+		})
+	}
+}
+
+func TestNeedsNonTemporaryActivation(t *testing.T) {
+	tests := []struct {
+		name     string
+		mounts   []Mount
+		expected bool
+	}{
+		{
+			name:     "empty mounts",
+			mounts:   []Mount{},
+			expected: false,
+		},
+		{
+			name: "bind mount",
+			mounts: []Mount{
+				{Type: "bind"},
+			},
+			expected: false,
+		},
+		{
+			name: "format mount",
+			mounts: []Mount{
+				{Type: "format/ext4"},
+			},
+			expected: true,
+		},
+		{
+			name: "mkfs mount",
+			mounts: []Mount{
+				{Type: "mkfs/ext4"},
+			},
+			expected: true,
+		},
+		{
+			name: "mkdir mount",
+			mounts: []Mount{
+				{Type: "mkdir/overlay"},
+			},
+			expected: true,
+		},
+		{
+			name: "erofs mount - not non-temporary",
+			mounts: []Mount{
+				{Type: "erofs"},
+			},
+			expected: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := NeedsNonTemporaryActivation(tc.mounts)
+			if got != tc.expected {
+				t.Errorf("NeedsNonTemporaryActivation() = %v, want %v", got, tc.expected)
+			}
+		})
+	}
+}
+
+func TestHasTemplate(t *testing.T) {
+	tests := []struct {
+		name     string
+		mount    Mount
+		expected bool
+	}{
+		{
+			name:     "no template",
+			mount:    Mount{Type: "bind", Source: "/src", Target: "/dst"},
+			expected: false,
+		},
+		{
+			name:     "template in source",
+			mount:    Mount{Source: "{{ mount 0 }}"},
+			expected: true,
+		},
+		{
+			name:     "template in target",
+			mount:    Mount{Target: "{{ mount 1 }}"},
+			expected: true,
+		},
+		{
+			name:     "template in options",
+			mount:    Mount{Options: []string{"lowerdir={{ mount 0 }}"}},
+			expected: true,
+		},
+		{
+			name:     "partial template syntax - opening only",
+			mount:    Mount{Source: "{{"},
+			expected: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := HasTemplate(tc.mount)
+			if got != tc.expected {
+				t.Errorf("HasTemplate() = %v, want %v", got, tc.expected)
+			}
+		})
+	}
+}
+
+func TestTypeBase(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		{"", ""},
+		{"bind", "bind"},
+		{"overlay", "overlay"},
+		{"format/ext4", "format"},
+		{"mkfs/ext4", "mkfs"},
+		{"format/mkdir/overlay", "format"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.input, func(t *testing.T) {
+			got := TypeBase(tc.input)
+			if got != tc.expected {
+				t.Errorf("TypeBase(%q) = %q, want %q", tc.input, got, tc.expected)
+			}
+		})
+	}
+}
+
+func TestTypeSuffix(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		{"", ""},
+		{"bind", "bind"},
+		{"overlay", "overlay"},
+		{"format/ext4", "ext4"},
+		{"mkfs/ext4", "ext4"},
+		{"format/mkdir/overlay", "overlay"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.input, func(t *testing.T) {
+			got := TypeSuffix(tc.input)
+			if got != tc.expected {
+				t.Errorf("TypeSuffix(%q) = %q, want %q", tc.input, got, tc.expected)
+			}
+		})
+	}
+}
+
+func TestUniqueRef(t *testing.T) {
+	// Generate multiple refs and ensure they're unique
+	refs := make(map[string]bool)
+	for i := 0; i < 100; i++ {
+		ref := UniqueRef()
+		if refs[ref] {
+			t.Errorf("UniqueRef() generated duplicate: %s", ref)
+		}
+		refs[ref] = true
+
+		// Check format: should contain timestamp and base64
+		if !strings.Contains(ref, "-") {
+			t.Errorf("UniqueRef() should contain separator: %s", ref)
+		}
+	}
+}
