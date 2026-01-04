@@ -1,3 +1,5 @@
+//go:build linux
+
 /*
    Copyright The containerd Authors.
 
@@ -16,13 +18,35 @@
 
 package erofs
 
+// This file contains the core EROFS snapshotter tests, test suite,
+// and shared helper functions used by other test files.
+//
+// Core tests in this file:
+// - TestErofs (testsuite)
+// - TestErofsWithQuota
+// - TestErofsFsverity
+//
+// Helper functions shared with erofs_differ_linux_test.go and
+// erofs_snapshot_linux_test.go:
+// - newSnapshotter
+// - testMount
+// - findErofs
+// - createTestTarContent
+// - tarHasPath
+// - cloneMounts
+// - mountsHaveTemplate
+// - snapshotID
+// - cleanupAllSnapshots
+
 import (
+	"archive/tar"
 	"context"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -31,13 +55,10 @@ import (
 	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/containerd/v2/core/snapshots/storage"
 	"github.com/containerd/containerd/v2/core/snapshots/testsuite"
-	"github.com/containerd/containerd/v2/internal/erofsutils"
 	"github.com/containerd/containerd/v2/internal/fsverity"
+	"github.com/containerd/containerd/v2/pkg/archive/compression"
 	"github.com/containerd/containerd/v2/pkg/archive/tartest"
 	"github.com/containerd/containerd/v2/pkg/testutil"
-	"github.com/containerd/containerd/v2/plugins/content/local"
-	erofsdiffer "github.com/containerd/containerd/v2/plugins/diff/erofs"
-	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
@@ -108,7 +129,7 @@ func TestErofsWithQuota(t *testing.T) {
 
 func TestErofsFsverity(t *testing.T) {
 	testutil.RequiresRoot(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	root := t.TempDir()
 
@@ -124,6 +145,7 @@ func TestErofsFsverity(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
+	defer cleanupAllSnapshots(ctx, s)
 
 	// Create a test snapshot
 	key := "test-snapshot"
@@ -181,165 +203,7 @@ func TestErofsFsverity(t *testing.T) {
 	}
 }
 
-func TestErofsDifferWithTarIndexMode(t *testing.T) {
-	testutil.RequiresRoot(t)
-	ctx := context.Background()
-
-	if !findErofs() {
-		t.Skip("check for erofs kernel support failed, skipping test")
-	}
-
-	// Check if mkfs.erofs supports tar index mode
-	supported, err := erofsutils.SupportGenerateFromTar()
-	if err != nil || !supported {
-		t.Skip("mkfs.erofs does not support tar mode, skipping tar index test")
-	}
-
-	tempDir := t.TempDir()
-
-	// Create content store for the differ
-	contentStore, err := local.NewStore(filepath.Join(tempDir, "content"))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Create EROFS differ with tar index mode enabled
-	differ := erofsdiffer.NewErofsDiffer(contentStore, erofsdiffer.WithTarIndexMode())
-
-	// Create EROFS snapshotter
-	snapshotRoot := filepath.Join(tempDir, "snapshots")
-	s, err := NewSnapshotter(snapshotRoot)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
-
-	// Create test tar content
-	tarReader := createTestTarContent()
-	defer tarReader.Close()
-
-	// Read the tar content into a buffer for digest calculation and writing
-	tarContent, err := io.ReadAll(tarReader)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Write tar content to content store
-	desc := ocispec.Descriptor{
-		MediaType: ocispec.MediaTypeImageLayerGzip,
-		Digest:    digest.FromBytes(tarContent),
-		Size:      int64(len(tarContent)),
-	}
-
-	writer, err := contentStore.Writer(ctx,
-		content.WithRef("test-layer"),
-		content.WithDescriptor(desc))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if _, err := writer.Write(tarContent); err != nil {
-		writer.Close()
-		t.Fatal(err)
-	}
-
-	if err := writer.Commit(ctx, desc.Size, desc.Digest); err != nil {
-		writer.Close()
-		t.Fatal(err)
-	}
-	writer.Close()
-
-	// Prepare a snapshot using the snapshotter
-	snapshotKey := "test-snapshot"
-	mounts, err := s.Prepare(ctx, snapshotKey, "")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Apply the tar content using the EROFS differ with tar index mode
-	appliedDesc, err := differ.Apply(ctx, desc, mounts)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	t.Logf("Applied layer using EROFS differ with tar index mode:")
-	t.Logf("  Original: %s (%d bytes)", desc.Digest, desc.Size)
-	t.Logf("  Applied:  %s (%d bytes)", appliedDesc.Digest, appliedDesc.Size)
-	t.Logf("  MediaType: %s", appliedDesc.MediaType)
-
-	// Commit the snapshot to finalize the EROFS layer creation
-	commitKey := "test-commit"
-	if err := s.Commit(ctx, commitKey, snapshotKey); err != nil {
-		t.Fatal(err)
-	}
-
-	// Get the internal snapshot ID to check the EROFS layer file
-	snap := s.(*snapshotter)
-	var id string
-	if err := snap.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
-		id, _, _, err = storage.GetInfo(ctx, commitKey)
-		return err
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	// Verify the EROFS layer file was created
-	layerPath := snap.layerBlobPath(id)
-	if _, err := os.Stat(layerPath); err != nil {
-		t.Fatalf("EROFS layer file should exist: %v", err)
-	}
-
-	// Verify the layer file is not empty
-	stat, err := os.Stat(layerPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if stat.Size() == 0 {
-		t.Fatal("EROFS layer file should not be empty")
-	}
-
-	t.Logf("EROFS layer file created with tar index mode: %s (%d bytes)", layerPath, stat.Size())
-
-	// Create a view to verify the content
-	viewKey := "test-view"
-	viewMounts, err := s.View(ctx, viewKey, commitKey)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	viewTarget := filepath.Join(tempDir, viewKey)
-	if err := os.MkdirAll(viewTarget, 0755); err != nil {
-		t.Fatal(err)
-	}
-	if err := mount.All(viewMounts, viewTarget); err != nil {
-		t.Fatal(err)
-	}
-	defer testutil.Unmount(t, viewTarget)
-
-	// Verify we can read the original test data
-	testData, err := os.ReadFile(filepath.Join(viewTarget, "test-file.txt"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	expected := testFileContent
-	if string(testData) != expected {
-		t.Fatalf("Expected %q, got %q", expected, string(testData))
-	}
-
-	// Verify nested file
-	nestedData, err := os.ReadFile(filepath.Join(viewTarget, "testdir", "nested.txt"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	expectedNested := testNestedFileContent
-	if string(nestedData) != expectedNested {
-		t.Fatalf("Expected %q, got %q", expectedNested, string(nestedData))
-	}
-
-	t.Logf("Successfully verified EROFS Snapshotter using the differ with tar index mode")
-}
-
-// Helper function to create test tar content using tartest
+// createTestTarContent creates test tar content using tartest.
 func createTestTarContent() io.ReadCloser {
 	// Create a tar context with current time for consistency
 	tc := tartest.TarContext{}.WithModTime(time.Now())
@@ -353,4 +217,92 @@ func createTestTarContent() io.ReadCloser {
 
 	// Return the tar as a ReadCloser
 	return tartest.TarFromWriterTo(tarWriter)
+}
+
+func tarHasPath(ctx context.Context, store content.Store, desc ocispec.Descriptor, target string) (bool, error) {
+	ra, err := store.ReaderAt(ctx, desc)
+	if err != nil {
+		return false, err
+	}
+	defer ra.Close()
+
+	rc := content.NewReader(ra)
+
+	dr, err := compression.DecompressStream(rc)
+	if err != nil {
+		return false, err
+	}
+	defer dr.Close()
+
+	tr := tar.NewReader(dr)
+	for {
+		h, err := tr.Next()
+		if err == io.EOF {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		name := strings.TrimPrefix(h.Name, "./")
+		if name == target {
+			return true, nil
+		}
+	}
+}
+
+func cloneMounts(in []mount.Mount) []mount.Mount {
+	if in == nil {
+		return nil
+	}
+	out := make([]mount.Mount, len(in))
+	for i := range in {
+		out[i] = in[i]
+		if len(in[i].Options) > 0 {
+			out[i].Options = append([]string(nil), in[i].Options...)
+		}
+	}
+	return out
+}
+
+func mountsHaveTemplate(mounts []mount.Mount) bool {
+	for _, m := range mounts {
+		if strings.Contains(m.Source, "{{") || strings.Contains(m.Target, "{{") {
+			return true
+		}
+		for _, opt := range m.Options {
+			if strings.Contains(opt, "{{") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func snapshotID(t *testing.T, s *snapshotter, key string) string {
+	t.Helper()
+	var id string
+	if err := s.ms.WithTransaction(t.Context(), false, func(ctx context.Context) error {
+		var err error
+		id, _, _, err = storage.GetInfo(ctx, key)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+// cleanupAllSnapshots removes all snapshots using only the public Snapshotter interface.
+// Snapshots are removed in reverse order (children first, then parents) to respect
+// the snapshot dependency chain. The Remove method handles internal cleanup of
+// active mounts and directories.
+func cleanupAllSnapshots(ctx context.Context, s snapshots.Snapshotter) {
+	var keys []string
+	_ = s.Walk(ctx, func(ctx context.Context, info snapshots.Info) error {
+		keys = append(keys, info.Name)
+		return nil
+	})
+	// Remove in reverse order (children first, then parents)
+	for i := len(keys) - 1; i >= 0; i-- {
+		_ = s.Remove(ctx, keys[i])
+	}
 }
