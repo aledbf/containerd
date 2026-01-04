@@ -23,6 +23,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/containerd/errdefs"
@@ -41,9 +43,20 @@ import (
 
 type walkingDiff struct {
 	store content.Store
+	mm    mount.Manager
 }
 
 var emptyDesc = ocispec.Descriptor{}
+
+// Option configures the walking differ.
+type Option func(*walkingDiff)
+
+// WithMountManager sets the mount manager used to resolve formatted mounts.
+func WithMountManager(mm mount.Manager) Option {
+	return func(d *walkingDiff) {
+		d.mm = mm
+	}
+}
 
 // NewWalkingDiff is a generic implementation of diff.Comparer.  The diff is
 // calculated by mounting both the upper and lower mount sets and walking the
@@ -51,10 +64,14 @@ var emptyDesc = ocispec.Descriptor{}
 // against each other or by comparing file existence between directories.
 // NewWalkingDiff uses no special characteristics of the mount sets and is
 // expected to work with any filesystem.
-func NewWalkingDiff(store content.Store) diff.Comparer {
-	return &walkingDiff{
+func NewWalkingDiff(store content.Store, opts ...Option) diff.Comparer {
+	d := &walkingDiff{
 		store: store,
 	}
+	for _, opt := range opts {
+		opt(d)
+	}
+	return d
 }
 
 // Compare creates a diff between the given mounts and uploads the result
@@ -98,8 +115,8 @@ func (s *walkingDiff) Compare(ctx context.Context, lower, upper []mount.Mount, o
 	}
 
 	var ocidesc ocispec.Descriptor
-	if err := mount.WithTempMount(ctx, lower, func(lowerRoot string) error {
-		return mount.WithReadonlyTempMount(ctx, upper, func(upperRoot string) error {
+	if err := s.withLowerMount(ctx, lower, func(lowerRoot string) error {
+		return s.withUpperMount(ctx, upper, func(upperRoot string) error {
 			var newReference bool
 			if config.Reference == "" {
 				newReference = true
@@ -204,6 +221,127 @@ func (s *walkingDiff) Compare(ctx context.Context, lower, upper []mount.Mount, o
 	}
 
 	return ocidesc, nil
+}
+
+func (s *walkingDiff) withLowerMount(ctx context.Context, mounts []mount.Mount, f func(root string) error) error {
+	return s.withResolvedMount(ctx, "walking-diff-lower", mounts, false, f)
+}
+
+func (s *walkingDiff) withUpperMount(ctx context.Context, mounts []mount.Mount, f func(root string) error) error {
+	return s.withResolvedMount(ctx, "walking-diff-upper", mounts, true, f)
+}
+
+func (s *walkingDiff) withResolvedMount(ctx context.Context, prefix string, mounts []mount.Mount, readonly bool, f func(root string) error) error {
+	if needsMountManager(mounts) {
+		if s.mm == nil {
+			return fmt.Errorf("mount manager is required to resolve formatted mounts: %w", errdefs.ErrNotImplemented)
+		}
+		name := prefix + "-" + uniqueRef()
+		temporary := !needsNonTemporaryMountManager(mounts)
+		// Clone the mounts slice to avoid modifying the caller's slice
+		// during activation (template resolution modifies options in place).
+		mountsCopy := slices.Clone(mounts)
+		var info mount.ActivationInfo
+		var err error
+		if temporary {
+			info, err = s.mm.Activate(ctx, name, mountsCopy, mount.WithTemporary)
+		} else {
+			info, err = s.mm.Activate(ctx, name, mountsCopy)
+		}
+		if err != nil {
+			return err
+		}
+		defer func() {
+			// Use a detached context for cleanup to ensure deactivation succeeds
+			// even if the parent context is cancelled.
+			cleanupCtx := context.WithoutCancel(ctx)
+			if derr := s.mm.Deactivate(cleanupCtx, name); derr != nil {
+				log.G(ctx).WithError(derr).Warnf("failed to deactivate mount %s", name)
+			}
+		}()
+		// Shortcut: if the result is a single bind mount, use the source directly
+		if len(info.System) == 1 && mountTypeSuffix(info.System[0].Type) == "bind" && info.System[0].Source != "" {
+			return f(info.System[0].Source)
+		}
+		if readonly {
+			return mount.WithReadonlyTempMount(ctx, info.System, f)
+		}
+		return mount.WithTempMount(ctx, info.System, f)
+	}
+	if readonly {
+		return mount.WithReadonlyTempMount(ctx, mounts, f)
+	}
+	return mount.WithTempMount(ctx, mounts, f)
+}
+
+// needsMountManager returns true if any mount requires the mount manager to resolve.
+// This includes mounts with template syntax (e.g., "{{ mount 0 }}"), formatted mounts
+// (format/, mkfs/, mkdir/), or EROFS mounts that need multi-device resolution.
+func needsMountManager(mounts []mount.Mount) bool {
+	for _, m := range mounts {
+		if hasTemplate(m) {
+			return true
+		}
+		mt := mountTypeBase(m.Type)
+		if mt == "format" || mt == "mkfs" || mt == "mkdir" {
+			return true
+		}
+		if mountTypeSuffix(m.Type) == "erofs" {
+			return true
+		}
+	}
+	return false
+}
+
+// needsNonTemporaryMountManager returns true if mounts require non-temporary
+// activation. Format, mkfs, and mkdir mounts may create persistent state that
+// should not be cleaned up immediately.
+func needsNonTemporaryMountManager(mounts []mount.Mount) bool {
+	for _, m := range mounts {
+		if strings.HasPrefix(m.Type, "format/") || strings.HasPrefix(m.Type, "mkfs/") || strings.HasPrefix(m.Type, "mkdir/") {
+			return true
+		}
+	}
+	return false
+}
+
+// hasTemplate returns true if the mount contains template syntax (e.g., "{{ mount 0 }}")
+// in its source, target, or options. Such mounts require resolution by the mount manager.
+func hasTemplate(m mount.Mount) bool {
+	if strings.Contains(m.Source, "{{") || strings.Contains(m.Target, "{{") {
+		return true
+	}
+	for _, opt := range m.Options {
+		if strings.Contains(opt, "{{") {
+			return true
+		}
+	}
+	return false
+}
+
+// mountTypeBase returns the base component of a mount type.
+// For "format/mkdir/overlay", it returns "format".
+// For simple types like "bind", it returns "bind".
+func mountTypeBase(t string) string {
+	if t == "" {
+		return ""
+	}
+	parts := strings.Split(t, "/")
+	if len(parts) == 1 {
+		return t
+	}
+	return parts[0]
+}
+
+// mountTypeSuffix returns the final component of a mount type.
+// For "format/mkdir/overlay", it returns "overlay".
+// For simple types like "bind", it returns "bind".
+func mountTypeSuffix(t string) string {
+	if t == "" {
+		return ""
+	}
+	parts := strings.Split(t, "/")
+	return parts[len(parts)-1]
 }
 
 func uniqueRef() string {

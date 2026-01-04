@@ -17,9 +17,12 @@
 package plugin
 
 import (
+	"errors"
+
 	"github.com/containerd/containerd/v2/core/diff"
 	"github.com/containerd/containerd/v2/core/diff/apply"
 	"github.com/containerd/containerd/v2/core/metadata"
+	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/plugins"
 	"github.com/containerd/containerd/v2/plugins/diff/walking"
 	"github.com/containerd/platforms"
@@ -43,8 +46,15 @@ func init() {
 			ic.Meta.Platforms = append(ic.Meta.Platforms, platforms.DefaultSpec())
 			cs := md.(*metadata.DB).ContentStore()
 
+			var mm mount.Manager
+			if mmI, err := ic.GetSingle(plugins.MountManagerPlugin); err == nil {
+				mm = mmI.(mount.Manager)
+			} else if !errors.Is(err, plugin.ErrPluginNotFound) {
+				return nil, err
+			}
+
 			return diffPlugin{
-				Comparer: walking.NewWalkingDiff(cs),
+				Comparer: walking.NewWalkingDiff(cs, walking.WithMountManager(mm)),
 				Applier:  apply.NewFileSystemApplier(cs),
 			}, nil
 		},
