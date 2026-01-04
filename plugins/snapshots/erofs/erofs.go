@@ -112,8 +112,6 @@ const (
 	extractMarker = ".erofs-extract"
 	// erofsLayerMarker indicates a directory is managed by the EROFS snapshotter.
 	erofsLayerMarker = ".erofslayer"
-	// preparedMarker indicates a snapshot has been prepared with a writable layer.
-	preparedMarker = ".prepared"
 )
 
 // NewSnapshotter returns a Snapshotter which uses EROFS+OverlayFS. The layers
@@ -499,32 +497,6 @@ func (s *snapshotter) isExtractSnapshot(id string) bool {
 	return err == nil
 }
 
-// isPreparedSnapshot returns true if the snapshot has been prepared with a writable layer.
-// This uses a filesystem marker that survives restarts, unlike an in-memory map.
-func (s *snapshotter) isPreparedSnapshot(id string) bool {
-	marker := filepath.Join(s.root, "snapshots", id, preparedMarker)
-	_, err := os.Stat(marker)
-	return err == nil
-}
-
-// markSnapshotPrepared creates a marker file indicating the snapshot is prepared.
-func (s *snapshotter) markSnapshotPrepared(id string) error {
-	marker := filepath.Join(s.root, "snapshots", id, preparedMarker)
-	return ensureMarkerFile(marker)
-}
-
-// consumePreparedMarker checks if a snapshot was prepared and removes the marker.
-// Returns true if the snapshot was prepared (first call after Prepare).
-func (s *snapshotter) consumePreparedMarker(id string) bool {
-	marker := filepath.Join(s.root, "snapshots", id, preparedMarker)
-	if _, err := os.Stat(marker); err != nil {
-		return false
-	}
-	// Remove the marker so subsequent Mounts() calls take the runtime path
-	os.Remove(marker)
-	return true
-}
-
 // isExtractKey returns true if the key indicates an extract/unpack operation.
 // Snapshot keys use forward slashes as separators (e.g., "default/1/extract-12345"),
 // so we use path.Base (POSIX paths) rather than filepath.Base (OS-specific).
@@ -819,9 +791,6 @@ func (s *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 		if err := s.createWritableLayer(ctx, snap.ID); err != nil {
 			return nil, fmt.Errorf("failed to create writable layer: %w", err)
 		}
-		if err := s.markSnapshotPrepared(snap.ID); err != nil {
-			return nil, fmt.Errorf("failed to mark snapshot as prepared: %w", err)
-		}
 	}
 
 	return s.mounts(snap, info)
@@ -1007,20 +976,14 @@ func (s *snapshotter) Mounts(ctx context.Context, key string) (_ []mount.Mount, 
 	}
 	var mounts []mount.Mount
 	if s.blockMode && snap.Kind == snapshots.KindActive && !s.isExtractSnapshot(snap.ID) {
-		// Check if this is the first Mounts() call after Prepare() by consuming the marker.
-		// This determines whether to use activeMounts (first call) or runtimeMounts (subsequent).
-		if s.consumePreparedMarker(snap.ID) {
-			mounts, err = s.activeMounts(snap)
-		} else {
-			// Cleanup host's active mounts before returning template mounts.
-			// This is critical because:
-			// 1. activeMounts() during Prepare/first-Mounts sets up ext4 on loop device
-			// 2. Template mounts will be processed by mount manager or VM, creating new mounts
-			// 3. Having two ext4 mounts on the same filesystem causes cache coherency issues
-			// 4. The diff/commit operations need to see fresh data from VM's writes
-			_ = cleanupActiveMounts(s.upperPath(snap.ID))
-			mounts, err = s.runtimeMounts(snap, info)
-		}
+		// For block mode, always return template mounts.
+		// The ext4 writable layer is already formatted by createWritableLayer() in Prepare().
+		// Template mounts are processed by the mount manager (e.g., qemubox VM runtime).
+		// We do NOT use activeMounts() here because:
+		// 1. activeMounts() sets up overlay on the HOST and returns a bind mount
+		// 2. VM-based runtimes can't use bind mounts - they need block devices
+		// 3. Host-mounted ext4 + VM-mounted ext4 on same file causes cache coherency issues
+		mounts, err = s.runtimeMounts(snap, info)
 	} else {
 		mounts, err = s.mounts(snap, info)
 	}

@@ -1955,29 +1955,31 @@ func TestErofsBlockModeMountsAfterPrepare(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// First Mounts() call returns bind mount (from activeMounts which sets up the overlay).
+	// Block mode always returns template mounts for mount manager to process.
+	// This ensures VM-based runtimes (like qemubox) can use block devices
+	// instead of bind mounts which they cannot use.
 	mounts1, err := snapshotter.Mounts(ctx, key)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(mounts1) != 1 || mounts1[0].Type != "bind" {
-		t.Fatalf("expected first Mounts to return bind mount, got: %#v", mounts1)
-	}
-
-	// Subsequent calls return template mounts for mount manager to resolve.
-	mounts2, err := snapshotter.Mounts(ctx, key)
-	if err != nil {
-		t.Fatal(err)
-	}
 	hasMkfs := false
-	for _, m := range mounts2 {
+	for _, m := range mounts1 {
 		if m.Type == "mkfs/ext4" {
 			hasMkfs = true
 			break
 		}
 	}
 	if !hasMkfs {
-		t.Fatalf("expected second Mounts to include mkfs/ext4, got: %#v", mounts2)
+		t.Fatalf("expected Mounts to include mkfs/ext4 template, got: %#v", mounts1)
+	}
+
+	// Subsequent calls return the same template mounts.
+	mounts2, err := snapshotter.Mounts(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mounts1) != len(mounts2) {
+		t.Fatalf("expected consistent mounts, got %d vs %d", len(mounts1), len(mounts2))
 	}
 
 	if err := snapshotter.Remove(ctx, key); err != nil {
