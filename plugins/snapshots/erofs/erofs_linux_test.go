@@ -682,15 +682,12 @@ func TestErofsDifferCompareBlockUpperFallback(t *testing.T) {
 	}
 
 	upperKey := "upper"
-	// Prepare() sets up the snapshot and returns bind mount (first access via activeMounts).
+	// Prepare() creates the snapshot with a runtime marker.
 	if _, err := s.Prepare(ctx, upperKey, "base-commit"); err != nil {
 		t.Fatal(err)
 	}
-	// First Mounts() call consumes the prepared marker and returns bind mount.
-	if _, err := s.Mounts(ctx, upperKey); err != nil {
-		t.Fatal(err)
-	}
-	// Second Mounts() call returns template mounts for mount manager.
+	// First Mounts() call consumes the runtime marker and returns template mounts.
+	// These template mounts are for VM runtimes that need block devices.
 	upperMounts, err := s.Mounts(ctx, upperKey)
 	if err != nil {
 		t.Fatal(err)
@@ -799,15 +796,12 @@ func TestErofsDifferComparePreservesWhiteouts(t *testing.T) {
 	}
 
 	upperKey := "upper"
-	// Prepare() sets up the snapshot and returns bind mount (first access via activeMounts).
+	// Prepare() creates the snapshot with a runtime marker.
 	if _, err := s.Prepare(ctx, upperKey, "base-commit"); err != nil {
 		t.Fatal(err)
 	}
-	// First Mounts() call consumes the prepared marker and returns bind mount.
-	if _, err := s.Mounts(ctx, upperKey); err != nil {
-		t.Fatal(err)
-	}
-	// Second Mounts() call returns template mounts for mount manager.
+	// First Mounts() call consumes the runtime marker and returns template mounts.
+	// These template mounts are for VM runtimes that need block devices.
 	upperMounts, err := s.Mounts(ctx, upperKey)
 	if err != nil {
 		t.Fatal(err)
@@ -895,15 +889,12 @@ func TestErofsDifferCompareWithFormattedUpperMounts(t *testing.T) {
 	}
 
 	upperKey := "upper"
-	// Prepare() sets up the snapshot and returns bind mount (first access via activeMounts).
+	// Prepare() creates the snapshot with a runtime marker.
 	if _, err := s.Prepare(ctx, upperKey, "base-commit"); err != nil {
 		t.Fatal(err)
 	}
-	// First Mounts() call consumes the prepared marker and returns bind mount.
-	if _, err := s.Mounts(ctx, upperKey); err != nil {
-		t.Fatal(err)
-	}
-	// Second Mounts() call returns template mounts for mount manager.
+	// First Mounts() call consumes the runtime marker and returns template mounts.
+	// These template mounts are for VM runtimes that need block devices.
 	upperMounts, err := s.Mounts(ctx, upperKey)
 	if err != nil {
 		t.Fatal(err)
@@ -1944,21 +1935,20 @@ func TestErofsBlockModeMountsAfterPrepare(t *testing.T) {
 	}
 
 	sn := newSnapshotter(t, WithDefaultSize(16*1024*1024))
-	snapshotter, cleanup, err := sn(ctx, t.TempDir())
+	snapshtr, cleanup, err := sn(ctx, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer cleanup()
 
 	key := "block-active"
-	if _, err := snapshotter.Prepare(ctx, key, ""); err != nil {
+	if _, err := snapshtr.Prepare(ctx, key, ""); err != nil {
 		t.Fatal(err)
 	}
 
-	// Block mode always returns template mounts for mount manager to process.
-	// This ensures VM-based runtimes (like qemubox) can use block devices
-	// instead of bind mounts which they cannot use.
-	mounts1, err := snapshotter.Mounts(ctx, key)
+	// First Mounts() call returns template mounts for VM runtime.
+	// VM-based runtimes (like qemubox) need block devices, not bind mounts.
+	mounts1, err := snapshtr.Mounts(ctx, key)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1970,19 +1960,38 @@ func TestErofsBlockModeMountsAfterPrepare(t *testing.T) {
 		}
 	}
 	if !hasMkfs {
-		t.Fatalf("expected Mounts to include mkfs/ext4 template, got: %#v", mounts1)
+		t.Fatalf("expected first Mounts to include mkfs/ext4 template, got: %#v", mounts1)
 	}
 
-	// Subsequent calls return the same template mounts.
-	mounts2, err := snapshotter.Mounts(ctx, key)
+	// Subsequent Mounts() calls return bind mount (for differ to read upper layer).
+	// By this point the VM runtime has stopped, so no dual-mount issues.
+	mounts2, err := snapshtr.Mounts(ctx, key)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(mounts1) != len(mounts2) {
-		t.Fatalf("expected consistent mounts, got %d vs %d", len(mounts1), len(mounts2))
+	if len(mounts2) != 1 || mounts2[0].Type != "bind" {
+		t.Fatalf("expected second Mounts to return bind mount, got: %#v", mounts2)
 	}
 
-	if err := snapshotter.Remove(ctx, key); err != nil {
+	// Cleanup active mounts before removing
+	snap := snapshtr.(*snapshotter)
+	id, _, _, err := func() (string, snapshots.Info, snapshots.Usage, error) {
+		var id string
+		var info snapshots.Info
+		var usage snapshots.Usage
+		err := snap.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
+			var err error
+			id, info, usage, err = storage.GetInfo(ctx, key)
+			return err
+		})
+		return id, info, usage, err
+	}()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = cleanupActiveMounts(snap.upperPath(id))
+
+	if err := snapshtr.Remove(ctx, key); err != nil {
 		t.Fatal(err)
 	}
 }

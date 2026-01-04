@@ -112,6 +112,10 @@ const (
 	extractMarker = ".erofs-extract"
 	// erofsLayerMarker indicates a directory is managed by the EROFS snapshotter.
 	erofsLayerMarker = ".erofslayer"
+	// runtimeMarker indicates the snapshot was prepared for a VM runtime.
+	// First Mounts() call returns template mounts (for VM).
+	// After marker is consumed, subsequent calls return actual mounts (for differ).
+	runtimeMarker = ".runtime"
 )
 
 // NewSnapshotter returns a Snapshotter which uses EROFS+OverlayFS. The layers
@@ -497,6 +501,25 @@ func (s *snapshotter) isExtractSnapshot(id string) bool {
 	return err == nil
 }
 
+// markForRuntime creates a marker indicating this snapshot needs template mounts
+// on the first Mounts() call (for VM runtimes like qemubox).
+func (s *snapshotter) markForRuntime(id string) error {
+	marker := filepath.Join(s.root, "snapshots", id, runtimeMarker)
+	return ensureMarkerFile(marker)
+}
+
+// consumeRuntimeMarker checks if the snapshot was prepared for a VM runtime.
+// If true, it removes the marker and returns true (first Mounts() call).
+// Subsequent calls return false, indicating the differ needs actual mounts.
+func (s *snapshotter) consumeRuntimeMarker(id string) bool {
+	marker := filepath.Join(s.root, "snapshots", id, runtimeMarker)
+	if _, err := os.Stat(marker); err != nil {
+		return false
+	}
+	os.Remove(marker)
+	return true
+}
+
 // isExtractKey returns true if the key indicates an extract/unpack operation.
 // Snapshot keys use forward slashes as separators (e.g., "default/1/extract-12345"),
 // so we use path.Base (POSIX paths) rather than filepath.Base (OS-specific).
@@ -791,6 +814,10 @@ func (s *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 		if err := s.createWritableLayer(ctx, snap.ID); err != nil {
 			return nil, fmt.Errorf("failed to create writable layer: %w", err)
 		}
+		// Mark for VM runtime - first Mounts() call returns template mounts.
+		if err := s.markForRuntime(snap.ID); err != nil {
+			return nil, fmt.Errorf("failed to mark for runtime: %w", err)
+		}
 	}
 
 	return s.mounts(snap, info)
@@ -976,14 +1003,21 @@ func (s *snapshotter) Mounts(ctx context.Context, key string) (_ []mount.Mount, 
 	}
 	var mounts []mount.Mount
 	if s.blockMode && snap.Kind == snapshots.KindActive && !s.isExtractSnapshot(snap.ID) {
-		// For block mode, always return template mounts.
-		// The ext4 writable layer is already formatted by createWritableLayer() in Prepare().
-		// Template mounts are processed by the mount manager (e.g., qemubox VM runtime).
-		// We do NOT use activeMounts() here because:
-		// 1. activeMounts() sets up overlay on the HOST and returns a bind mount
-		// 2. VM-based runtimes can't use bind mounts - they need block devices
-		// 3. Host-mounted ext4 + VM-mounted ext4 on same file causes cache coherency issues
-		mounts, err = s.runtimeMounts(snap, info)
+		// Block mode has two different callers with different needs:
+		// 1. VM runtime (first call): Needs template mounts to set up its own overlay
+		// 2. Differ (subsequent calls): Needs actual mounts to read the filesystem
+		//
+		// The marker distinguishes these cases:
+		// - First Mounts() call consumes marker, returns template mounts
+		// - Subsequent calls return actual overlay mounts (VM is stopped by then)
+		if s.consumeRuntimeMarker(snap.ID) {
+			// First call: VM runtime needs template mounts (block devices)
+			mounts, err = s.runtimeMounts(snap, info)
+		} else {
+			// Subsequent calls: Differ needs actual mounts to read upper layer
+			// VM is stopped by now, so no dual-mount cache issues
+			mounts, err = s.activeMounts(snap)
+		}
 	} else {
 		mounts, err = s.mounts(snap, info)
 	}
