@@ -2001,6 +2001,15 @@ func TestErofsCleanupRemovesOrphan(t *testing.T) {
 		t.Fatal("snapshotter does not implement Cleanup")
 	}
 
+	// Create and commit a snapshot to initialize the metadata store bucket.
+	_, err = snapshtr.Prepare(ctx, "init", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := snapshtr.Commit(ctx, "committed", "init"); err != nil {
+		t.Fatal(err)
+	}
+
 	// Create an orphan snapshot directory not tracked by metadata.
 	orphanDir := filepath.Join(snapshtr.(*snapshotter).root, "snapshots", "orphan")
 	if err := os.MkdirAll(filepath.Join(orphanDir, "fs"), 0755); err != nil {
