@@ -131,6 +131,10 @@ func (mm *mountManager) Activate(ctx context.Context, name string, mounts []moun
 		return mount.ActivationInfo{}, err
 	}
 
+	// Clone the mounts slice to avoid mutating the caller's slice.
+	// Template resolution and transformations modify mounts in place.
+	mounts = slices.Clone(mounts)
+
 	log.G(ctx).WithField("name", name).WithField("mounts", mounts).Debugf("activating mount")
 
 	lid, leased := leases.FromContext(ctx)
