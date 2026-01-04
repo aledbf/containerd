@@ -123,6 +123,37 @@ improved performance, as shown below:
     mkfs_options = ["-T0", "--mkfs-time", "--sort=none"]
 ```
 
+### Mount Manager Configuration
+
+The EROFS snapshotter integrates with containerd's mount manager for advanced
+features like block mode (quota support) and template mount resolution. The
+mount manager is **required** for:
+
+- **Block mode** (`default_size` configured): Block devices need the mount
+  manager to format and mount ext4 filesystems for writable layers.
+
+- **Differ Compare operations with template mounts**: When comparing snapshots
+  with multiple EROFS layers, the differ needs the mount manager to resolve
+  overlay template mounts.
+
+To enable the mount manager, add to your configuration:
+
+``` toml
+  # Enable the mount manager plugin
+  [plugins."io.containerd.mount-manager.v1.bolt"]
+```
+
+The EROFS differ uses lazy resolution to obtain the mount manager, so plugin
+initialization order doesn't matter. If the mount manager is not configured
+but required for an operation, a clear error message will be returned:
+`mount manager is required to resolve formatted mounts`.
+
+**When is mount manager NOT required?**
+
+- Single-layer EROFS snapshots (View returns a direct EROFS mount)
+- Standard container operations without block mode
+- Using the EROFS snapshotter with a non-EROFS differ
+
 ### Running a container
 
 To run a container using the EROFS snapshotter, it needs to be explicitly
@@ -237,8 +268,91 @@ For the EROFS differ:
   enable_tar_index = true
 ```
 
+## Migration Guide
+
+### Upgrading to containerd 2.2+
+
+If you are upgrading from an earlier version of containerd and using the EROFS
+snapshotter, be aware of the following changes:
+
+#### Mount Manager Requirement for Block Mode
+
+If you use **block mode** (quota support via `default_size`), you must now
+enable the mount manager plugin:
+
+``` toml
+  [plugins."io.containerd.mount-manager.v1.bolt"]
+```
+
+Without this configuration, operations that require block device formatting
+will fail with `mount manager is required to resolve formatted mounts`.
+
+#### Differ Compare Operations
+
+The EROFS differ now uses the mount manager for Compare operations when
+snapshots have multiple EROFS layers (which produce overlay template mounts).
+If you only use Apply operations or single-layer snapshots, no changes are
+needed.
+
+#### Backward Compatibility
+
+- Existing EROFS layer blobs remain compatible
+- The `.erofslayer` marker file format is unchanged
+- Single-layer operations work without mount manager
+- The snapshotter continues to work with non-EROFS differs
+
+#### Recommended Configuration
+
+For full functionality with the EROFS snapshotter and differ:
+
+``` toml
+  # Enable mount manager for block mode and template resolution
+  [plugins."io.containerd.mount-manager.v1.bolt"]
+
+  # Configure EROFS snapshotter
+  [plugins."io.containerd.snapshotter.v1.erofs"]
+    # Optional: enable quota support (requires mount manager)
+    # default_size = "20GiB"
+
+    # Optional: enable fsverity for data integrity
+    # enable_fsverity = true
+
+  # Configure EROFS differ with optimized settings (erofs-utils 1.8.2+)
+  [plugins."io.containerd.differ.v1.erofs"]
+    mkfs_options = ["-T0", "--mkfs-time", "--sort=none"]
+
+  # Set differ priority
+  [plugins."io.containerd.service.v1.diff-service"]
+    default = ["erofs", "walking"]
+```
+
+## Troubleshooting
+
+### "mount manager is required to resolve formatted mounts"
+
+This error occurs when an operation requires the mount manager but it's not
+configured. Add the mount manager plugin to your configuration:
+
+``` toml
+  [plugins."io.containerd.mount-manager.v1.bolt"]
+```
+
+### "mount layer type must be erofs-layer"
+
+This error from the EROFS differ indicates the mounts are not from the EROFS
+snapshotter. The differ checks for the `.erofslayer` marker file to validate
+layers. Ensure you're using the EROFS snapshotter for both Apply and Compare.
+
+### Differ falls back to walking differ
+
+The EROFS differ returns `ErrNotImplemented` for non-EROFS layers, allowing
+fallback to the walking differ. This is expected behavior when:
+
+- Using a different snapshotter
+- Layers were created without the `.erofslayer` marker
+
 ## TODO
 
- - ID-mapped mount spport;
+ - ID-mapped mount support;
 
  - DMVerity support.

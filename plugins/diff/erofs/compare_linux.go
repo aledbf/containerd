@@ -77,6 +77,20 @@ func (s erofsDiff) mountManager() mount.Manager {
 
 // Compare creates a diff between the given mounts and uploads the result
 // to the content store.
+//
+// Mount Manager Requirements:
+//
+// The mount manager is required when mounts contain templates, format/mkfs/mkdir
+// transformers, or multi-device EROFS mounts. These require runtime resolution
+// that cannot be done with static mount paths. If the mount manager is required
+// but not configured, Compare returns an error with "mount manager is required".
+//
+// The mount manager is NOT required for:
+//   - Single EROFS layer mounts (direct file access)
+//   - Simple bind mounts with the .erofslayer marker
+//   - Empty lower mounts (base layer creation)
+//
+// See also: requiresMountResolution() for the detailed logic.
 func (s erofsDiff) Compare(ctx context.Context, lower, upper []mount.Mount, opts ...diff.Opt) (d ocispec.Descriptor, err error) {
 	var config diff.Config
 	for _, opt := range opts {
