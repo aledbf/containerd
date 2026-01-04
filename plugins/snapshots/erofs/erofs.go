@@ -25,7 +25,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/containerd/continuity/fs"
@@ -106,11 +105,16 @@ type snapshotter struct {
 	defaultWritable  int64
 	blockMode        bool
 	fsMergeThreshold uint
-	prepareMu        sync.Mutex
-	prepareMounts    map[string]struct{}
 }
 
-const extractMarker = ".erofs-extract"
+const (
+	// extractMarker indicates a snapshot is used for layer extraction (unpacking).
+	extractMarker = ".erofs-extract"
+	// erofsLayerMarker indicates a directory is managed by the EROFS snapshotter.
+	erofsLayerMarker = ".erofslayer"
+	// preparedMarker indicates a snapshot has been prepared with a writable layer.
+	preparedMarker = ".prepared"
+)
 
 // NewSnapshotter returns a Snapshotter which uses EROFS+OverlayFS. The layers
 // are stored under the provided root. A metadata file is stored under the root.
@@ -167,7 +171,6 @@ func NewSnapshotter(root string, opts ...Opt) (snapshots.Snapshotter, error) {
 		defaultWritable:  config.defaultSize,
 		blockMode:        config.defaultSize > 0,
 		fsMergeThreshold: config.fsMergeThreshold,
-		prepareMounts:    map[string]struct{}{},
 	}, nil
 }
 
@@ -270,7 +273,7 @@ func (s *snapshotter) prepareDirectory(ctx context.Context, snapshotDir string, 
 		}
 		// Create a special file for the EROFS differ to indicate it will be
 		// prepared as an EROFS layer by the EROFS snapshotter.
-		if err := os.WriteFile(filepath.Join(td, ".erofslayer"), []byte{}, 0644); err != nil {
+		if err := os.WriteFile(filepath.Join(td, erofsLayerMarker), []byte{}, 0644); err != nil {
 			return td, err
 		}
 	}
@@ -304,108 +307,42 @@ func (s *snapshotter) mountFsMeta(snap storage.Snapshot, id int) (mount.Mount, b
 	return m, true
 }
 
+// mounts returns mount specifications for a snapshot.
+// For blockMode active snapshots, it performs actual mounting via activeMounts.
+// For other cases, it returns template-based mount specs for the mount manager.
 func (s *snapshotter) mounts(snap storage.Snapshot, info snapshots.Info) ([]mount.Mount, error) {
-	var options []string
-
 	if s.blockMode && snap.Kind == snapshots.KindActive {
 		if s.isExtractSnapshot(snap.ID) {
 			return s.diffMounts(snap)
 		}
 		return s.activeMounts(snap)
 	}
+	return s.templateMounts(snap)
+}
+
+// runtimeMounts returns mount specifications for an already-prepared snapshot.
+// Unlike mounts(), it never calls activeMounts() since the snapshot is already set up.
+func (s *snapshotter) runtimeMounts(snap storage.Snapshot, info snapshots.Info) ([]mount.Mount, error) {
+	if s.blockMode && snap.Kind == snapshots.KindActive && s.isExtractSnapshot(snap.ID) {
+		return s.diffMounts(snap)
+	}
+	return s.templateMounts(snap)
+}
+
+// templateMounts builds mount specifications using templates for the mount manager.
+// This is the common implementation used by both mounts() and runtimeMounts().
+func (s *snapshotter) templateMounts(snap storage.Snapshot) ([]mount.Mount, error) {
+	var options []string
 
 	if len(snap.ParentIDs) == 0 {
-		if layerBlob, err := s.lowerPath(snap.ID); err == nil {
-			if snap.Kind != snapshots.KindView {
-				return nil, fmt.Errorf("only works for snapshots.KindView on a committed snapshot: %w", err)
-			}
-			if s.enableFsverity {
-				if err := s.verifyFsverity(layerBlob); err != nil {
-					return nil, err
-				}
-			}
-			return []mount.Mount{
-				{
-					Source:  layerBlob,
-					Type:    "erofs",
-					Options: []string{"ro", "loop"},
-				},
-			}, nil
-		}
-		// if we only have one layer/no parents then just return a bind mount as overlay
-		// will not work
-		roFlag := "rw"
-		if snap.Kind == snapshots.KindView {
-			roFlag = "ro"
-		}
-		if s.blockMode {
-			// The writable layer file is pre-created by createWritableLayer()
-			// but we still use mkfs/ext4 type so the mount manager creates upper dir
-			return []mount.Mount{
-				{
-					Source: s.writablePath(snap.ID),
-					Type:   "mkfs/ext4",
-					Options: []string{
-						"X-containerd.mkfs.fs=ext4",
-						// TODO: Get size from snapshot labels
-						fmt.Sprintf("X-containerd.mkfs.size=%d", s.defaultWritable),
-						// TODO: Add UUID
-						roFlag,
-						"loop",
-					},
-				},
-				{
-					Source: "{{ mount 0 }}/upper",
-					Type:   "format/mkdir/bind",
-					Options: append(options,
-						"X-containerd.mkdir.path={{ mount 0 }}/upper:0755",
-						roFlag,
-						"rbind",
-					),
-				},
-			}, nil
-		} else {
-			return []mount.Mount{
-				{
-					Source: s.upperPath(snap.ID),
-					Type:   "bind",
-					Options: append(options,
-						roFlag,
-						"rbind",
-					),
-				},
-			}, nil
-		}
+		return s.singleLayerMounts(snap, options)
 	}
 
 	var mounts []mount.Mount
 	if snap.Kind == snapshots.KindActive {
-		if s.blockMode {
-			// The writable layer file is pre-created by createWritableLayer()
-			// but we still use mkfs/ext4 type so the mount manager creates dirs
-			mounts = append(mounts, mount.Mount{
-				Source: s.writablePath(snap.ID),
-				Type:   "mkfs/ext4",
-				Options: []string{
-					"X-containerd.mkfs.fs=ext4",
-					fmt.Sprintf("X-containerd.mkfs.size=%d", s.defaultWritable),
-					"rw",
-					"loop",
-				},
-			})
-			options = append(options,
-				"X-containerd.mkdir.path={{ mount 0 }}/upper:0755",
-				"X-containerd.mkdir.path={{ mount 0 }}/work:0755",
-				"workdir={{ mount 0 }}/work",
-				"upperdir={{ mount 0 }}/upper",
-			)
-		} else {
-			options = append(options,
-				fmt.Sprintf("workdir=%s", s.workPath(snap.ID)),
-				fmt.Sprintf("upperdir=%s", s.upperPath(snap.ID)),
-			)
-		}
+		mounts, options = s.activeLayerMounts(snap, options)
 	} else if len(snap.ParentIDs) == 1 {
+		// Single parent view - return EROFS mount directly
 		layerBlob, err := s.lowerPath(snap.ParentIDs[0])
 		if err != nil {
 			return nil, err
@@ -419,10 +356,9 @@ func (s *snapshotter) mounts(snap storage.Snapshot, info snapshots.Info) ([]moun
 		}, nil
 	}
 
+	// Build lower layer mounts
 	first := len(mounts)
 	for i := range snap.ParentIDs {
-		// If a merged fsmeta is valid for this layer, skip the remaining bottom layers.
-		// Why? Because bottom layers have been flattened with the thin fsmeta.
 		if s.fsMergeThreshold > 0 {
 			if m, ok := s.mountFsMeta(snap, i); ok {
 				mounts = append(mounts, m)
@@ -435,18 +371,15 @@ func (s *snapshotter) mounts(snap storage.Snapshot, info snapshots.Info) ([]moun
 		if err != nil {
 			return nil, err
 		}
-
-		m := mount.Mount{
+		mounts = append(mounts, mount.Mount{
 			Source:  layerBlob,
 			Type:    "erofs",
 			Options: []string{"ro", "loop"},
-		}
-
-		mounts = append(mounts, m)
+		})
 	}
+
+	// Build overlay options
 	if (len(mounts) - first) == 1 {
-		// Fast-path: for KindView with a single lower mount (e.g., after fsmeta merge),
-		// return the EROFS mounts directly without requiring mount manager resolution.
 		if snap.Kind == snapshots.KindView {
 			return mounts, nil
 		}
@@ -466,107 +399,17 @@ func (s *snapshotter) mounts(snap storage.Snapshot, info snapshots.Info) ([]moun
 	}), nil
 }
 
-func (s *snapshotter) runtimeMounts(snap storage.Snapshot, info snapshots.Info) ([]mount.Mount, error) {
-	var options []string
-
-	if s.blockMode && snap.Kind == snapshots.KindActive && s.isExtractSnapshot(snap.ID) {
-		return s.diffMounts(snap)
-	}
-
-	if len(snap.ParentIDs) == 0 {
-		if layerBlob, err := s.lowerPath(snap.ID); err == nil {
-			if snap.Kind != snapshots.KindView {
-				return nil, fmt.Errorf("only works for snapshots.KindView on a committed snapshot: %w", err)
+// singleLayerMounts returns mounts for a snapshot with no parent layers.
+func (s *snapshotter) singleLayerMounts(snap storage.Snapshot, options []string) ([]mount.Mount, error) {
+	// Check if this is a committed layer
+	if layerBlob, err := s.lowerPath(snap.ID); err == nil {
+		if snap.Kind != snapshots.KindView {
+			return nil, fmt.Errorf("only works for snapshots.KindView on a committed snapshot: %w", err)
+		}
+		if s.enableFsverity {
+			if err := s.verifyFsverity(layerBlob); err != nil {
+				return nil, err
 			}
-			if s.enableFsverity {
-				if err := s.verifyFsverity(layerBlob); err != nil {
-					return nil, err
-				}
-			}
-			return []mount.Mount{
-				{
-					Source:  layerBlob,
-					Type:    "erofs",
-					Options: []string{"ro", "loop"},
-				},
-			}, nil
-		}
-		// if we only have one layer/no parents then just return a bind mount as overlay
-		// will not work
-		roFlag := "rw"
-		if snap.Kind == snapshots.KindView {
-			roFlag = "ro"
-		}
-		if s.blockMode {
-			// The writable layer file is pre-created by createWritableLayer()
-			// but we still use mkfs/ext4 type so the mount manager creates upper dir
-			return []mount.Mount{
-				{
-					Source: s.writablePath(snap.ID),
-					Type:   "mkfs/ext4",
-					Options: []string{
-						"X-containerd.mkfs.fs=ext4",
-						// TODO: Get size from snapshot labels
-						fmt.Sprintf("X-containerd.mkfs.size=%d", s.defaultWritable),
-						// TODO: Add UUID
-						roFlag,
-						"loop",
-					},
-				},
-				{
-					Source: "{{ mount 0 }}/upper",
-					Type:   "format/mkdir/bind",
-					Options: append(options,
-						"X-containerd.mkdir.path={{ mount 0 }}/upper:0755",
-						roFlag,
-						"rbind",
-					),
-				},
-			}, nil
-		}
-		return []mount.Mount{
-			{
-				Source: s.upperPath(snap.ID),
-				Type:   "bind",
-				Options: append(options,
-					roFlag,
-					"rbind",
-				),
-			},
-		}, nil
-	}
-
-	var mounts []mount.Mount
-	if snap.Kind == snapshots.KindActive {
-		if s.blockMode {
-			// The writable layer file is pre-created by createWritableLayer()
-			// but we still use mkfs/ext4 type so the mount manager creates dirs
-			mounts = append(mounts, mount.Mount{
-				Source: s.writablePath(snap.ID),
-				Type:   "mkfs/ext4",
-				Options: []string{
-					"X-containerd.mkfs.fs=ext4",
-					fmt.Sprintf("X-containerd.mkfs.size=%d", s.defaultWritable),
-					"rw",
-					"loop",
-				},
-			})
-			options = append(options,
-				"X-containerd.mkdir.path={{ mount 0 }}/upper:0755",
-				"X-containerd.mkdir.path={{ mount 0 }}/work:0755",
-				"workdir={{ mount 0 }}/work",
-				"upperdir={{ mount 0 }}/upper",
-			)
-		} else {
-			options = append(options,
-				fmt.Sprintf("workdir=%s", s.workPath(snap.ID)),
-				fmt.Sprintf("upperdir=%s", s.upperPath(snap.ID)),
-			)
-		}
-	} else if len(snap.ParentIDs) == 1 {
-		layerBlob, err := s.lowerPath(snap.ParentIDs[0])
-		if err != nil {
-			return nil, err
 		}
 		return []mount.Mount{
 			{
@@ -577,51 +420,77 @@ func (s *snapshotter) runtimeMounts(snap storage.Snapshot, info snapshots.Info) 
 		}, nil
 	}
 
-	first := len(mounts)
-	for i := range snap.ParentIDs {
-		// If a merged fsmeta is valid for this layer, skip the remaining bottom layers.
-		// Why? Because bottom layers have been flattened with the thin fsmeta.
-		if s.fsMergeThreshold > 0 {
-			if m, ok := s.mountFsMeta(snap, i); ok {
-				mounts = append(mounts, m)
-				first = len(mounts) - 1
-				break
-			}
-		}
-
-		layerBlob, err := s.lowerPath(snap.ParentIDs[i])
-		if err != nil {
-			return nil, err
-		}
-
-		m := mount.Mount{
-			Source:  layerBlob,
-			Type:    "erofs",
-			Options: []string{"ro", "loop"},
-		}
-
-		mounts = append(mounts, m)
-	}
-	if (len(mounts) - first) == 1 {
-		// Fast-path: for KindView with a single lower mount (e.g., after fsmeta merge),
-		// return the EROFS mounts directly without requiring mount manager resolution.
-		if snap.Kind == snapshots.KindView {
-			return mounts, nil
-		}
-		options = append(options, fmt.Sprintf("lowerdir={{ mount %d }}", first))
-	} else {
-		options = append(options, fmt.Sprintf("lowerdir={{ overlay %d %d }}", first, len(mounts)-1))
-	}
+	// No parents and no committed layer - return bind mount
+	roFlag := "rw"
 	if snap.Kind == snapshots.KindView {
-		options = append(options, "ro")
+		roFlag = "ro"
 	}
-	options = append(options, s.ovlOptions...)
 
-	return append(mounts, mount.Mount{
-		Type:    "format/mkdir/overlay",
-		Source:  "overlay",
-		Options: options,
-	}), nil
+	if s.blockMode {
+		return []mount.Mount{
+			{
+				Source: s.writablePath(snap.ID),
+				Type:   "mkfs/ext4",
+				Options: []string{
+					"X-containerd.mkfs.fs=ext4",
+					fmt.Sprintf("X-containerd.mkfs.size=%d", s.defaultWritable),
+					roFlag,
+					"loop",
+				},
+			},
+			{
+				Source: "{{ mount 0 }}/upper",
+				Type:   "format/mkdir/bind",
+				Options: append(options,
+					"X-containerd.mkdir.path={{ mount 0 }}/upper:0755",
+					roFlag,
+					"rbind",
+				),
+			},
+		}, nil
+	}
+
+	return []mount.Mount{
+		{
+			Source: s.upperPath(snap.ID),
+			Type:   "bind",
+			Options: append(options,
+				roFlag,
+				"rbind",
+			),
+		},
+	}, nil
+}
+
+// activeLayerMounts returns the initial mounts and options for an active snapshot.
+func (s *snapshotter) activeLayerMounts(snap storage.Snapshot, options []string) ([]mount.Mount, []string) {
+	var mounts []mount.Mount
+
+	if s.blockMode {
+		mounts = append(mounts, mount.Mount{
+			Source: s.writablePath(snap.ID),
+			Type:   "mkfs/ext4",
+			Options: []string{
+				"X-containerd.mkfs.fs=ext4",
+				fmt.Sprintf("X-containerd.mkfs.size=%d", s.defaultWritable),
+				"rw",
+				"loop",
+			},
+		})
+		options = append(options,
+			"X-containerd.mkdir.path={{ mount 0 }}/upper:0755",
+			"X-containerd.mkdir.path={{ mount 0 }}/work:0755",
+			"workdir={{ mount 0 }}/work",
+			"upperdir={{ mount 0 }}/upper",
+		)
+	} else {
+		options = append(options,
+			fmt.Sprintf("workdir=%s", s.workPath(snap.ID)),
+			fmt.Sprintf("upperdir=%s", s.upperPath(snap.ID)),
+		)
+	}
+
+	return mounts, options
 }
 
 func (s *snapshotter) isExtractSnapshot(id string) bool {
@@ -630,11 +499,51 @@ func (s *snapshotter) isExtractSnapshot(id string) bool {
 	return err == nil
 }
 
+// isPreparedSnapshot returns true if the snapshot has been prepared with a writable layer.
+// This uses a filesystem marker that survives restarts, unlike an in-memory map.
+func (s *snapshotter) isPreparedSnapshot(id string) bool {
+	marker := filepath.Join(s.root, "snapshots", id, preparedMarker)
+	_, err := os.Stat(marker)
+	return err == nil
+}
+
+// markSnapshotPrepared creates a marker file indicating the snapshot is prepared.
+func (s *snapshotter) markSnapshotPrepared(id string) error {
+	marker := filepath.Join(s.root, "snapshots", id, preparedMarker)
+	return ensureMarkerFile(marker)
+}
+
+// consumePreparedMarker checks if a snapshot was prepared and removes the marker.
+// Returns true if the snapshot was prepared (first call after Prepare).
+func (s *snapshotter) consumePreparedMarker(id string) bool {
+	marker := filepath.Join(s.root, "snapshots", id, preparedMarker)
+	if _, err := os.Stat(marker); err != nil {
+		return false
+	}
+	// Remove the marker so subsequent Mounts() calls take the runtime path
+	os.Remove(marker)
+	return true
+}
+
+// isExtractKey returns true if the key indicates an extract/unpack operation.
+// Snapshot keys use forward slashes as separators (e.g., "default/1/extract-12345"),
+// so we use path.Base (POSIX paths) rather than filepath.Base (OS-specific).
 func isExtractKey(key string) bool {
 	return strings.HasPrefix(path.Base(key), snapshots.UnpackKeyPrefix)
 }
 
-func (s *snapshotter) activeMounts(snap storage.Snapshot) (_ []mount.Mount, err error) {
+// ensureMarkerFile creates a marker file at the given path if it doesn't exist.
+func ensureMarkerFile(path string) error {
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return os.WriteFile(path, nil, 0644)
+		}
+		return err
+	}
+	return nil
+}
+
+func (s *snapshotter) activeMounts(snap storage.Snapshot) ([]mount.Mount, error) {
 	upperRoot := s.upperPath(snap.ID)
 	rwRoot := filepath.Join(upperRoot, "rw")
 	upperDir := filepath.Join(rwRoot, "upper")
@@ -648,36 +557,17 @@ func (s *snapshotter) activeMounts(snap storage.Snapshot) (_ []mount.Mount, err 
 	if err := os.MkdirAll(rwRoot, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create rw root: %w", err)
 	}
-	upperMounted, err := mountinfo.Mounted(rwRoot)
-	if err != nil {
-		return nil, fmt.Errorf("failed to check rw root mount: %w", err)
-	}
-	if !upperMounted {
-		ext4Mount := mount.Mount{
-			Source:  s.writablePath(snap.ID),
-			Type:    "ext4",
-			Options: []string{"rw", "loop"},
-		}
-		if err := mount.All([]mount.Mount{ext4Mount}, rwRoot); err != nil {
-			return nil, fmt.Errorf("failed to mount writable layer: %w", err)
-		}
-		defer func() {
-			if err != nil {
-				_ = cleanupActiveMounts(upperRoot)
-			}
-		}()
+
+	// Mount the writable layer if not already mounted
+	if err := s.ensureWritableMount(snap.ID, rwRoot, upperRoot); err != nil {
+		return nil, err
 	}
 
-	if err := os.MkdirAll(upperDir, 0755); err != nil {
-		return nil, fmt.Errorf("failed to create upper dir: %w", err)
-	}
-	if err := os.MkdirAll(workDir, 0755); err != nil {
-		return nil, fmt.Errorf("failed to create work dir: %w", err)
-	}
-	if err := os.MkdirAll(mergedDir, 0755); err != nil {
-		return nil, fmt.Errorf("failed to create merged dir: %w", err)
+	if err := s.ensureActiveDirectories(upperDir, workDir, mergedDir); err != nil {
+		return nil, err
 	}
 
+	// Check if already fully mounted
 	mergedMounted, err := mountinfo.Mounted(mergedDir)
 	if err != nil {
 		return nil, fmt.Errorf("failed to check merged mount: %w", err)
@@ -692,15 +582,10 @@ func (s *snapshotter) activeMounts(snap storage.Snapshot) (_ []mount.Mount, err 
 		}, nil
 	}
 
+	// Create marker files
 	for _, markerRoot := range []string{upperRoot, rwRoot} {
-		if _, err := os.Stat(filepath.Join(markerRoot, ".erofslayer")); err != nil {
-			if os.IsNotExist(err) {
-				if err := os.WriteFile(filepath.Join(markerRoot, ".erofslayer"), []byte{}, 0644); err != nil {
-					return nil, fmt.Errorf("failed to create erofs marker: %w", err)
-				}
-			} else {
-				return nil, fmt.Errorf("failed to stat erofs marker: %w", err)
-			}
+		if err := ensureMarkerFile(filepath.Join(markerRoot, erofsLayerMarker)); err != nil {
+			return nil, fmt.Errorf("failed to create erofs marker in %s: %w", markerRoot, err)
 		}
 	}
 
@@ -714,42 +599,56 @@ func (s *snapshotter) activeMounts(snap storage.Snapshot) (_ []mount.Mount, err 
 		}, nil
 	}
 
-	var lowerMounts []mount.Mount
-	for i := range snap.ParentIDs {
-		if s.fsMergeThreshold > 0 {
-			if m, ok := s.mountFsMeta(snap, i); ok {
-				lowerMounts = append(lowerMounts, m)
-				break
-			}
-		}
-		layerBlob, err := s.lowerPath(snap.ParentIDs[i])
-		if err != nil {
-			return nil, err
-		}
-		lowerMounts = append(lowerMounts, mount.Mount{
-			Source:  layerBlob,
-			Type:    "erofs",
-			Options: []string{"ro", "loop"},
-		})
+	// Mount lower layers and overlay
+	return s.mountOverlay(snap, upperRoot, upperDir, workDir, mergedDir)
+}
+
+// ensureWritableMount mounts the ext4 writable layer if not already mounted.
+func (s *snapshotter) ensureWritableMount(id, rwRoot, upperRoot string) error {
+	mounted, err := mountinfo.Mounted(rwRoot)
+	if err != nil {
+		return fmt.Errorf("failed to check rw root mount: %w", err)
+	}
+	if mounted {
+		return nil
+	}
+
+	ext4Mount := mount.Mount{
+		Source:  s.writablePath(id),
+		Type:    "ext4",
+		Options: []string{"rw", "loop"},
+	}
+	if err := mount.All([]mount.Mount{ext4Mount}, rwRoot); err != nil {
+		return fmt.Errorf("failed to mount writable layer: %w", err)
+	}
+	return nil
+}
+
+// ensureActiveDirectories creates the upper, work, and merged directories.
+func (s *snapshotter) ensureActiveDirectories(upperDir, workDir, mergedDir string) error {
+	if err := os.MkdirAll(upperDir, 0755); err != nil {
+		return fmt.Errorf("failed to create upper dir: %w", err)
+	}
+	if err := os.MkdirAll(workDir, 0755); err != nil {
+		return fmt.Errorf("failed to create work dir: %w", err)
+	}
+	if err := os.MkdirAll(mergedDir, 0755); err != nil {
+		return fmt.Errorf("failed to create merged dir: %w", err)
+	}
+	return nil
+}
+
+// mountOverlay mounts the lower EROFS layers and creates the overlay mount.
+func (s *snapshotter) mountOverlay(snap storage.Snapshot, upperRoot, upperDir, workDir, mergedDir string) ([]mount.Mount, error) {
+	lowerMounts, err := s.collectLowerMounts(snap)
+	if err != nil {
+		return nil, err
 	}
 
 	lowerRoot := filepath.Join(upperRoot, "lower")
-	var lowerDirs []string
-	for i, m := range lowerMounts {
-		target := filepath.Join(lowerRoot, fmt.Sprintf("%d", i))
-		if err := os.MkdirAll(target, 0755); err != nil {
-			return nil, fmt.Errorf("failed to create lower dir: %w", err)
-		}
-		mounted, err := mountinfo.Mounted(target)
-		if err != nil {
-			return nil, fmt.Errorf("failed to check lower mount: %w", err)
-		}
-		if !mounted {
-			if err := mount.All([]mount.Mount{m}, target); err != nil {
-				return nil, fmt.Errorf("failed to mount lower layer: %w", err)
-			}
-		}
-		lowerDirs = append(lowerDirs, target)
+	lowerDirs, err := s.mountLowerLayers(lowerMounts, lowerRoot)
+	if err != nil {
+		return nil, err
 	}
 
 	options := []string{
@@ -758,6 +657,7 @@ func (s *snapshotter) activeMounts(snap storage.Snapshot) (_ []mount.Mount, err 
 		fmt.Sprintf("workdir=%s", workDir),
 	}
 	options = append(options, s.ovlOptions...)
+
 	overlay := mount.Mount{
 		Type:    "overlay",
 		Source:  "overlay",
@@ -776,21 +676,63 @@ func (s *snapshotter) activeMounts(snap storage.Snapshot) (_ []mount.Mount, err 
 	}, nil
 }
 
-func (s *snapshotter) diffMounts(snap storage.Snapshot) (_ []mount.Mount, err error) {
+// collectLowerMounts collects the EROFS mount specifications for parent layers.
+func (s *snapshotter) collectLowerMounts(snap storage.Snapshot) ([]mount.Mount, error) {
+	var lowerMounts []mount.Mount
+	for i := range snap.ParentIDs {
+		if s.fsMergeThreshold > 0 {
+			if m, ok := s.mountFsMeta(snap, i); ok {
+				lowerMounts = append(lowerMounts, m)
+				break
+			}
+		}
+		layerBlob, err := s.lowerPath(snap.ParentIDs[i])
+		if err != nil {
+			return nil, err
+		}
+		lowerMounts = append(lowerMounts, mount.Mount{
+			Source:  layerBlob,
+			Type:    "erofs",
+			Options: []string{"ro", "loop"},
+		})
+	}
+	return lowerMounts, nil
+}
+
+// mountLowerLayers mounts each lower layer and returns the list of mount points.
+func (s *snapshotter) mountLowerLayers(lowerMounts []mount.Mount, lowerRoot string) ([]string, error) {
+	var lowerDirs []string
+	for i, m := range lowerMounts {
+		target := filepath.Join(lowerRoot, fmt.Sprintf("%d", i))
+		if err := os.MkdirAll(target, 0755); err != nil {
+			return nil, fmt.Errorf("failed to create lower dir: %w", err)
+		}
+		mounted, err := mountinfo.Mounted(target)
+		if err != nil {
+			return nil, fmt.Errorf("failed to check lower mount: %w", err)
+		}
+		if !mounted {
+			if err := mount.All([]mount.Mount{m}, target); err != nil {
+				return nil, fmt.Errorf("failed to mount lower layer: %w", err)
+			}
+		}
+		lowerDirs = append(lowerDirs, target)
+	}
+	return lowerDirs, nil
+}
+
+func (s *snapshotter) diffMounts(snap storage.Snapshot) ([]mount.Mount, error) {
 	upperRoot := s.upperPath(snap.ID)
 	layerRoot := filepath.Dir(upperRoot)
+
 	if err := os.MkdirAll(upperRoot, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create upper root: %w", err)
 	}
-	if _, err := os.Stat(filepath.Join(layerRoot, ".erofslayer")); err != nil {
-		if os.IsNotExist(err) {
-			if err := os.WriteFile(filepath.Join(layerRoot, ".erofslayer"), []byte{}, 0644); err != nil {
-				return nil, fmt.Errorf("failed to create erofs marker: %w", err)
-			}
-		} else {
-			return nil, fmt.Errorf("failed to stat erofs marker: %w", err)
-		}
+
+	if err := ensureMarkerFile(filepath.Join(layerRoot, erofsLayerMarker)); err != nil {
+		return nil, fmt.Errorf("failed to create erofs marker: %w", err)
 	}
+
 	return []mount.Mount{
 		{
 			Type:    "bind",
@@ -877,9 +819,9 @@ func (s *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 		if err := s.createWritableLayer(ctx, snap.ID); err != nil {
 			return nil, fmt.Errorf("failed to create writable layer: %w", err)
 		}
-		s.prepareMu.Lock()
-		s.prepareMounts[key] = struct{}{}
-		s.prepareMu.Unlock()
+		if err := s.markSnapshotPrepared(snap.ID); err != nil {
+			return nil, fmt.Errorf("failed to mark snapshot as prepared: %w", err)
+		}
 	}
 
 	return s.mounts(snap, info)
@@ -1054,14 +996,9 @@ func (s *snapshotter) Mounts(ctx context.Context, key string) (_ []mount.Mount, 
 	}
 	var mounts []mount.Mount
 	if s.blockMode && snap.Kind == snapshots.KindActive && !s.isExtractSnapshot(snap.ID) {
-		s.prepareMu.Lock()
-		_, prepared := s.prepareMounts[key]
-		if prepared {
-			delete(s.prepareMounts, key)
-		}
-		s.prepareMu.Unlock()
-
-		if prepared {
+		// Check if this is the first Mounts() call after Prepare() by consuming the marker.
+		// This determines whether to use activeMounts (first call) or runtimeMounts (subsequent).
+		if s.consumePreparedMarker(snap.ID) {
 			mounts, err = s.activeMounts(snap)
 		} else {
 			mounts, err = s.runtimeMounts(snap, info)
@@ -1137,9 +1074,8 @@ func (s *snapshotter) Remove(ctx context.Context, key string) (err error) {
 		if err != nil {
 			return fmt.Errorf("failed to remove snapshot %s: %w", key, err)
 		}
-		s.prepareMu.Lock()
-		delete(s.prepareMounts, key)
-		s.prepareMu.Unlock()
+		// Note: The prepared marker file (if any) is removed when the snapshot
+		// directory is cleaned up below.
 
 		removals, err = s.getCleanupDirectories(ctx)
 		if err != nil {
