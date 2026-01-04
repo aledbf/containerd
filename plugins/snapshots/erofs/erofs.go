@@ -313,7 +313,7 @@ func (s *snapshotter) mounts(snap storage.Snapshot, info snapshots.Info) ([]moun
 		if s.isExtractSnapshot(snap.ID) {
 			return s.diffMounts(snap)
 		}
-		return s.activeMounts(snap)
+		return s.templateMounts(snap)
 	}
 	return s.templateMounts(snap)
 }
@@ -974,27 +974,7 @@ func (s *snapshotter) Mounts(ctx context.Context, key string) (_ []mount.Mount, 
 	}); err != nil {
 		return nil, err
 	}
-	var mounts []mount.Mount
-	if s.blockMode && snap.Kind == snapshots.KindActive && !s.isExtractSnapshot(snap.ID) {
-		// Block mode: Check if overlay is already mounted on host.
-		// If mounted, return bind mount (for differ that already processed templates).
-		// If not mounted, return template mounts (for VM runtime or differ with mount manager).
-		upperRoot := s.upperPath(snap.ID)
-		mergedDir := filepath.Join(upperRoot, "merged")
-		if mounted, _ := mountinfo.Mounted(mergedDir); mounted {
-			// Overlay is mounted on host, return bind mount
-			mounts = []mount.Mount{{
-				Type:    "bind",
-				Source:  mergedDir,
-				Options: []string{"rw", "rbind"},
-			}}
-		} else {
-			// No overlay on host, return template mounts
-			mounts, err = s.runtimeMounts(snap, info)
-		}
-	} else {
-		mounts, err = s.mounts(snap, info)
-	}
+	mounts, err := s.mounts(snap, info)
 	if err != nil {
 		return nil, err
 	}

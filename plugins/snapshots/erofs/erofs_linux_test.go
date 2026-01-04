@@ -780,15 +780,50 @@ func TestErofsDifferComparePreservesWhiteouts(t *testing.T) {
 	defer s.Close()
 	defer cleanupAllSnapshots(ctx, s)
 
-	snap := s.(*snapshotter)
-
-	baseKey := "base"
-	if _, err := s.Prepare(ctx, baseKey, ""); err != nil {
+	db, err := bolt.Open(filepath.Join(tempDir, "mounts.db"), 0600, nil)
+	if err != nil {
 		t.Fatal(err)
 	}
-	baseID := snapshotID(t, snap, baseKey)
-	// In block mode, activeMounts() sets up rw/upper structure, so write there
-	if err := os.WriteFile(filepath.Join(snap.upperDir(baseID), "gone.txt"), []byte("gone"), 0644); err != nil {
+	defer db.Close()
+
+	mountRoot := filepath.Join(tempDir, "mounts")
+	mm, err := manager.NewManager(db, mountRoot, manager.WithAllowedRoot(snapshotRoot))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if closer, ok := mm.(interface{ Close() error }); ok {
+		defer closer.Close()
+	}
+
+	baseKey := "base"
+	baseMounts, err := s.Prepare(ctx, baseKey, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	activation, err := mm.Activate(ctx, "base-activate-"+time.Now().Format("150405.000"), cloneMounts(baseMounts))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wroteFile := false
+	for _, a := range activation.Active {
+		if mountTypeSuffixTest(a.Type) != "ext4" || a.MountPoint == "" {
+			continue
+		}
+		upperDir := filepath.Join(a.MountPoint, "upper")
+		if err := os.MkdirAll(upperDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(upperDir, "gone.txt"), []byte("gone"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		wroteFile = true
+		break
+	}
+	if !wroteFile {
+		_ = mm.Deactivate(ctx, activation.Name)
+		t.Fatal("failed to locate ext4 mount to write gone.txt")
+	}
+	if err := mm.Deactivate(ctx, activation.Name); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Commit(ctx, "base-commit", baseKey); err != nil {
@@ -813,22 +848,7 @@ func TestErofsDifferComparePreservesWhiteouts(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db, err := bolt.Open(filepath.Join(tempDir, "mounts.db"), 0600, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-
-	mountRoot := filepath.Join(tempDir, "mounts")
-	mm, err := manager.NewManager(db, mountRoot, manager.WithAllowedRoot(snapshotRoot))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if closer, ok := mm.(interface{ Close() error }); ok {
-		defer closer.Close()
-	}
-
-	activation, err := mm.Activate(ctx, "upper-activate-"+time.Now().Format("150405.000"), cloneMounts(upperMounts))
+	activation, err = mm.Activate(ctx, "upper-activate-"+time.Now().Format("150405.000"), cloneMounts(upperMounts))
 	if err != nil {
 		t.Fatal(err)
 	}
